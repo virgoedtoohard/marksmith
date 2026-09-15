@@ -15,8 +15,15 @@ const paperDeep = "#F1EDE1";
 
 const fontsCSS = `@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap');`;
 
+// ============ BACKEND (Cloudflare Worker) ============
+// Fill this in after you deploy the worker/ folder — see worker/README or
+// the deployment instructions you were given. Example:
+// "https://marksmith-proxy.yourname.workers.dev"
+const WORKER_URL = "https://REPLACE-WITH-YOUR-WORKER-URL.workers.dev";
+
 // ============ SETTINGS STORAGE ============
-const STORAGE_KEY = "marksmith:apiKey";
+const STORAGE_KEY = "marksmith:apiKey"; // now holds a signed session token, not a raw Anthropic key
+const ORG_KEY = "marksmith:org";
 const MODEL_KEY = "marksmith:model";
 const DEFAULT_MODEL = "claude-sonnet-4-5-20250929";
 const MODELS = [
@@ -30,6 +37,12 @@ function loadApiKey() {
 }
 function saveApiKey(v) {
   try { if (v) localStorage.setItem(STORAGE_KEY, v); else localStorage.removeItem(STORAGE_KEY); } catch {}
+}
+function loadOrgName() {
+  try { return localStorage.getItem(ORG_KEY) || ""; } catch { return ""; }
+}
+function saveOrgName(v) {
+  try { if (v) localStorage.setItem(ORG_KEY, v); else localStorage.removeItem(ORG_KEY); } catch {}
 }
 function loadModel() {
   try { return localStorage.getItem(MODEL_KEY) || DEFAULT_MODEL; } catch { return DEFAULT_MODEL; }
@@ -52,14 +65,12 @@ function cleanJSON(text) {
 }
 
 async function callClaude(apiKey, model, system, userContent, maxTokens = 2000) {
-  if (!apiKey) throw new Error("No API key set. Open Settings and paste your Anthropic API key.");
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  if (!apiKey) throw new Error("You're not signed in. Open Settings and sign in with your organization's access code.");
+  const res = await fetch(`${WORKER_URL}/api/messages`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
+      "Authorization": `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
       model: model || DEFAULT_MODEL,
@@ -171,7 +182,7 @@ const editInput = {
 function KeyBanner({ onNav }) {
   return (
     <div style={{ background: paperDeep, borderLeft: `3px solid ${warn}`, padding: "12px 20px", marginBottom: 24, fontSize: 14, color: inkSoft, borderRadius: 2 }}>
-      No API key set. <button onClick={() => onNav("settings")} style={{ background: "none", border: "none", color: bronze, borderBottom: `1px solid ${bronze}`, cursor: "pointer", padding: 0, fontFamily: "inherit", fontSize: "inherit" }}>Open Settings</button> to add one before running a review.
+      You're not signed in. <button onClick={() => onNav("settings")} style={{ background: "none", border: "none", color: bronze, borderBottom: `1px solid ${bronze}`, cursor: "pointer", padding: 0, fontFamily: "inherit", fontSize: "inherit" }}>Open Settings</button> to sign in with your organization's access code before running a review.
     </div>
   );
 }
@@ -209,7 +220,7 @@ function Nav({ current, onNav, hasKey }) {
                 display: "flex", alignItems: "center", gap: 6,
               }}>
                 {it.label}
-                {isSettings && !hasKey && <span title="No API key set" style={{ width: 6, height: 6, borderRadius: "50%", background: warn, display: "inline-block" }}/>}
+                {isSettings && !hasKey && <span title="Not signed in" style={{ width: 6, height: 6, borderRadius: "50%", background: warn, display: "inline-block" }}/>}
               </button>
             );
           })}
@@ -923,53 +934,73 @@ ${(selected.keyFacts || []).map((f) => `- ${f}`).join("\n")}`;
 }
 
 // ============ SETTINGS ============
-function Settings({ apiKey, setApiKey, model, setModel }) {
-  const [draft, setDraft] = useState(apiKey);
-  const [showKey, setShowKey] = useState(false);
-  const [saved, setSaved] = useState(false);
+function Settings({ apiKey, setApiKey, orgName, setOrgName, model, setModel }) {
+  const [code, setCode] = useState("");
+  const [password, setPassword] = useState("");
+  const [signingIn, setSigningIn] = useState(false);
+  const [error, setError] = useState("");
+  const [usage, setUsage] = useState(null);
 
-  useEffect(() => { setDraft(apiKey); }, [apiKey]);
-
-  function save() {
-    setApiKey(draft.trim());
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+  async function signIn() {
+    setError("");
+    if (!code.trim() || !password) { setError("Enter your organization's access code and password."); return; }
+    setSigningIn(true);
+    try {
+      const res = await fetch(`${WORKER_URL}/api/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: code.trim(), password }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `Sign-in failed (${res.status})`);
+      setApiKey(data.token);
+      setOrgName(data.org || code.trim());
+      setUsage({ used: data.used, limit: data.monthlyLimit });
+      setPassword("");
+    } catch (e) {
+      setError(e.message || "Could not sign in. Check the access code and password, or try again shortly.");
+    } finally {
+      setSigningIn(false);
+    }
   }
-  function clear() {
-    if (window.confirm("Remove your API key from this browser?")) {
-      setDraft(""); setApiKey("");
+  function signOut() {
+    if (window.confirm("Sign out of Marksmith on this browser?")) {
+      setApiKey(""); setOrgName("");
     }
   }
 
-  const maskedHint = apiKey ? `Currently saved: ${apiKey.slice(0, 8)}…${apiKey.slice(-4)}` : "No key saved.";
-
   return (
     <div style={{ maxWidth: 800, margin: "0 auto", padding: "40px 32px 80px" }}>
-      <PageHeader eyebrow="Settings" title="Your API key" desc="Marksmith runs on the Claude API. Because this site is hosted statically, you bring your own key."/>
+      <PageHeader eyebrow="Settings" title="Sign in" desc="Marksmith runs on the Claude API through your organization's account. Sign in with the access code and password your administrator gave you."/>
 
       <div style={{ marginTop: 40 }}>
-        <SubHeading>Anthropic API key</SubHeading>
-        <div style={{ border: `1px solid ${rule}`, background: "#fff", padding: 20, borderRadius: 2 }}>
-          <div style={{ display: "flex", gap: 8 }}>
-            <input type={showKey ? "text" : "password"} value={draft} onChange={(e) => setDraft(e.target.value)}
-              placeholder="sk-ant-…"
-              style={{ ...editInput, background: paper, fontFamily: "'JetBrains Mono', monospace", fontSize: 13, flex: 1 }}/>
-            <button onClick={() => setShowKey(!showKey)} style={ghostBtn}>{showKey ? "Hide" : "Show"}</button>
+        <SubHeading>Organization access</SubHeading>
+        {apiKey ? (
+          <div style={{ border: `1px solid ${rule}`, background: "#fff", padding: 20, borderRadius: 2 }}>
+            <div style={{ fontSize: 14, color: inkSoft }}>Signed in as <strong style={{ color: ink }}>{orgName || "your organization"}</strong>.</div>
+            {usage && <div style={{ marginTop: 8, fontSize: 12, color: muted, fontFamily: "'JetBrains Mono', monospace" }}>Usage this month: {usage.used}{usage.limit ? ` / ${usage.limit}` : ""}</div>}
+            <div style={{ marginTop: 16 }}>
+              <button onClick={signOut} style={{ ...ghostBtn, color: warn }}>Sign out</button>
+            </div>
           </div>
-          <div style={{ marginTop: 12, fontSize: 12, color: muted, fontFamily: "'JetBrains Mono', monospace", letterSpacing: "0.06em" }}>{maskedHint}</div>
-          <div style={{ marginTop: 20, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-            <button onClick={save} style={primaryBtn(false)}>Save key</button>
-            {apiKey && <button onClick={clear} style={{ ...ghostBtn, color: warn }}>Clear key</button>}
-            {saved && <span style={{ fontSize: 13, color: good }}>Saved.</span>}
+        ) : (
+          <div style={{ border: `1px solid ${rule}`, background: "#fff", padding: 20, borderRadius: 2 }}>
+            <div style={{ display: "grid", gap: 10 }}>
+              <input value={code} onChange={(e) => setCode(e.target.value)} placeholder="Access code"
+                style={{ ...editInput, background: paper, fontSize: 14 }}/>
+              <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password"
+                onKeyDown={(e) => e.key === "Enter" && signIn()}
+                style={{ ...editInput, background: paper, fontSize: 14 }}/>
+            </div>
+            {error && <div style={{ marginTop: 10, fontSize: 13, color: bad }}>{error}</div>}
+            <div style={{ marginTop: 16 }}>
+              <button onClick={signIn} disabled={signingIn} style={primaryBtn(signingIn)}>{signingIn ? "Signing in…" : "Sign in"}</button>
+            </div>
           </div>
-        </div>
+        )}
 
         <div style={{ marginTop: 16, padding: 16, background: paperDeep, borderLeft: `3px solid ${bronze}`, borderRadius: 2, fontSize: 13, color: inkSoft, lineHeight: 1.6 }}>
-          <strong style={{ color: ink }}>Where the key lives.</strong> Your key is stored only in this browser's localStorage. It never touches a server other than <code>api.anthropic.com</code> directly. Clearing browser data clears the key. Do not enter your key on a shared computer.
-        </div>
-
-        <div style={{ marginTop: 12, fontSize: 13, color: muted }}>
-          Get a key at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noreferrer" style={{ color: bronze, borderBottom: `1px solid ${bronze}`, textDecoration: "none" }}>console.anthropic.com</a>.
+          <strong style={{ color: ink }}>Don't have an access code?</strong> Contact the person who set up Marksmith for your organization — they issue codes and can set usage limits per organization.
         </div>
       </div>
 
@@ -1006,7 +1037,7 @@ function About() {
         <AboutStep n="IV" title="Draft the reply" body="When you're ready to write to the applicant, Feedback pulls the review you did and drafts a letter — award, waitlist, or decline — in the tone you pick. Scores stay off the letter."/>
       </div>
       <div style={{ marginTop: 48, padding: 24, background: paperDeep, borderLeft: `3px solid ${bronze}`, borderRadius: 2, fontSize: 14, color: inkSoft, lineHeight: 1.7 }}>
-        <strong style={{ color: ink }}>Note.</strong> Marksmith is a first-pass reader. It doesn't replace a human review; it gets the boring parts out of the way. Reviews live in the current window only. Your API key is stored locally in this browser.
+        <strong style={{ color: ink }}>Note.</strong> Marksmith is a first-pass reader. It doesn't replace a human review; it gets the boring parts out of the way. Reviews live in the current window only. Your sign-in session is stored locally in this browser.
       </div>
     </div>
   );
@@ -1057,9 +1088,11 @@ export default function App() {
   const [rubric, setRubric] = useState(DEFAULT_RUBRIC);
   const [savedReviews, setSavedReviews] = useState([]);
   const [apiKey, setApiKeyState] = useState(loadApiKey());
+  const [orgName, setOrgNameState] = useState(loadOrgName());
   const [model, setModelState] = useState(loadModel());
 
   function setApiKey(v) { setApiKeyState(v); saveApiKey(v); }
+  function setOrgName(v) { setOrgNameState(v); saveOrgName(v); }
   function setModel(v) { setModelState(v); saveModel(v); }
   function handleSaveReview(r) { setSavedReviews((all) => [...all, r]); }
 
@@ -1074,7 +1107,7 @@ export default function App() {
       {page === "compare" && <CompareTool apiKey={apiKey} model={model} rubric={rubric} onSaveReview={handleSaveReview} onNav={setPage}/>}
       {page === "rubric" && <RubricBuilder rubric={rubric} setRubric={setRubric}/>}
       {page === "feedback" && <FeedbackComposer apiKey={apiKey} model={model} savedReviews={savedReviews} onNav={setPage}/>}
-      {page === "settings" && <Settings apiKey={apiKey} setApiKey={setApiKey} model={model} setModel={setModel}/>}
+      {page === "settings" && <Settings apiKey={apiKey} setApiKey={setApiKey} orgName={orgName} setOrgName={setOrgName} model={model} setModel={setModel}/>}
       {page === "about" && <About/>}
       <Footer/>
     </div>
