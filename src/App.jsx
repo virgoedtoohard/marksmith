@@ -103,11 +103,15 @@ function newRecordId() {
 
 // ============ RECORDS SYNC (per organization, via the Worker) ============
 // Records used to live only in whichever browser created them. Now every
-// mutation is pushed to the Worker under the signed-in organization's own
-// key, and signing in anywhere pulls that organization's records down and
-// merges them with whatever's already local — so "the same account" means
-// the same records, on any browser.
-const MAX_RECORDS_SYNC_BYTES = 20 * 1024 * 1024;
+// mutation pushes just the ONE record it touched to the Worker (which stores
+// it under its own key, per organization) instead of replacing one shared
+// blob for the whole org — so several reviewers signed in with the same
+// access code at the same time can each add or update a different
+// application without racing to overwrite each other's latest change.
+// While signed in, the app also polls for records other reviewers added or
+// changed, so everyone converges without needing to sign out and back in.
+const MAX_RECORD_SYNC_BYTES = 20 * 1024 * 1024;
+const RECORDS_POLL_MS = 20000;
 async function fetchRemoteRecords(apiKey) {
   const res = await fetch(`${WORKER_URL}/api/records`, {
     headers: { Authorization: `Bearer ${apiKey}` },
@@ -116,23 +120,37 @@ async function fetchRemoteRecords(apiKey) {
   const data = await res.json().catch(() => ({}));
   return Array.isArray(data.records) ? data.records : [];
 }
-async function pushRemoteRecords(apiKey, records) {
-  let payload = records;
+// If a single record (usually one with an attached PDF/photo) is too big to
+// sync, drop just its file — the score, text, status, history, and letters
+// still sync; the original file stays only on the browser that has it.
+function shrinkRecordForSync(record) {
   try {
-    if (new TextEncoder().encode(JSON.stringify(payload)).length > MAX_RECORDS_SYNC_BYTES) {
-      payload = stripOldFileBlocks(records);
-    }
-  } catch { /* fall through with the original payload */ }
+    if (new TextEncoder().encode(JSON.stringify(record)).length <= MAX_RECORD_SYNC_BYTES) return record;
+  } catch { return record; }
+  if (!record.application?.fileBlock) return record;
+  return { ...record, application: { ...record.application, fileBlock: null, note: "Original file too large to sync — kept only on the browser that uploaded it." } };
+}
+async function pushRemoteRecord(apiKey, record) {
   try {
     await fetch(`${WORKER_URL}/api/records`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ records: payload }),
+      body: JSON.stringify({ record: shrinkRecordForSync(record) }),
     });
   } catch {
     // Offline or the Worker is unreachable — this browser's own copy (in
-    // localStorage) is already saved regardless; the next successful sync
-    // will catch the server back up.
+    // localStorage) is already saved regardless; the next poll or edit
+    // retries the sync.
+  }
+}
+async function deleteRemoteRecord(apiKey, id) {
+  try {
+    await fetch(`${WORKER_URL}/api/records/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+  } catch {
+    // best-effort, same as above.
   }
 }
 // Combines this browser's records with the organization's server copy,
@@ -1681,7 +1699,7 @@ function Settings({ apiKey, setApiKey, orgName, setOrgName }) {
         {apiKey ? (
           <div style={{ border: `1px solid ${rule}`, background: "#fff", padding: 20, borderRadius: 2 }}>
             <div style={{ fontSize: 14, color: inkSoft }}>Signed in as <strong style={{ color: ink }}>{orgName || "your organization"}</strong>.</div>
-            <div style={{ marginTop: 6, fontSize: 12, color: muted }}>Records sync to any browser signed in with this same access code, and clear from this one when you sign out.</div>
+            <div style={{ marginTop: 6, fontSize: 12, color: muted }}>Records sync automatically to every reviewer and browser signed in with this same access code — even at the same time — usually within {RECORDS_POLL_MS / 1000} seconds, and clear from this one when you sign out.</div>
             {usage && <div style={{ marginTop: 8, fontSize: 12, color: muted, fontFamily: "'JetBrains Mono', monospace" }}>Usage this month: {usage.used}{usage.limit ? ` / ${usage.limit}` : ""}</div>}
             <div style={{ marginTop: 16 }}>
               <button onClick={signOut} style={{ ...ghostBtn, color: warn }}>Sign out</button>
@@ -1794,10 +1812,10 @@ export default function App() {
 
   function setApiKey(v) {
     if (!v && apiKey) {
-      // Signing out — flush this browser's latest edits to the organization's
-      // server copy one last time, then wipe the local copy so applicant
-      // data doesn't linger in this browser once no one's signed in.
-      pushRemoteRecords(apiKey, savedReviews);
+      // Signing out — wipe this browser's local copy so applicant data
+      // doesn't linger once no one's signed in. Nothing is lost: every edit
+      // was already pushed to the organization's server copy the moment it
+      // happened, not batched up for sign-out.
       setSavedReviews([]);
       saveRecords([]);
     }
@@ -1805,29 +1823,41 @@ export default function App() {
   }
   function setOrgName(v) { setOrgNameState(v); saveOrgName(v); }
 
-  // Whenever we're signed in (fresh sign-in, or already signed in on reload),
-  // pull this organization's records from the server and merge them with
-  // whatever's local, so a different browser signed into the same account
-  // sees the same records instead of an empty list.
+  // While signed in, pull this organization's records from the server and
+  // merge them with whatever's local — once immediately (so a different
+  // browser, or a fresh sign-in, sees the same records instead of an empty
+  // list), then on a short interval, so several reviewers signed in with the
+  // same access code at once converge on the same list without anyone
+  // needing to sign out and back in.
   useEffect(() => {
     if (!apiKey) return;
     let cancelled = false;
-    (async () => {
+    let firstSync = true;
+    async function sync() {
       try {
         const remote = await fetchRemoteRecords(apiKey);
         if (cancelled) return;
+        const remoteIds = new Set(remote.map((r) => r.id));
         setSavedReviews((local) => {
           const merged = mergeRecords(local, remote);
           saveRecords(merged);
-          pushRemoteRecords(apiKey, merged);
+          if (firstSync) {
+            // Push up anything that only exists on this browser — e.g.
+            // records made before cross-browser sync existed, or while
+            // offline — so every other reviewer's browser picks them up too.
+            local.filter((r) => !remoteIds.has(r.id)).forEach((r) => pushRemoteRecord(apiKey, r));
+          }
           return merged;
         });
       } catch {
-        // Offline or the Worker is unreachable — keep what's local; this
-        // retries every time apiKey changes (e.g. the next sign-in).
+        // Offline or the Worker is unreachable — keep what's local; the
+        // next tick (or the next sign-in) retries.
       }
-    })();
-    return () => { cancelled = true; };
+      firstSync = false;
+    }
+    sync();
+    const interval = setInterval(sync, RECORDS_POLL_MS);
+    return () => { cancelled = true; clearInterval(interval); };
   }, [apiKey]);
   function setRubric(updater) {
     setRubricState((prev) => {
@@ -1840,27 +1870,34 @@ export default function App() {
     setSavedReviews((all) => {
       const next = [r, ...all];
       saveRecords(next);
-      if (apiKey) pushRemoteRecords(apiKey, next);
+      if (apiKey) pushRemoteRecord(apiKey, r);
       return next;
     });
   }
   function updateRecordStatus(id, status) {
     setSavedReviews((all) => {
+      let updated = null;
       const next = all.map((r) => {
         if (r.id !== id) return r;
         const entry = { status, changedAt: new Date().toISOString(), changedBy: orgName || "Unknown organization" };
-        return { ...r, status, history: [...(r.history || []), entry], updatedAt: new Date().toISOString() };
+        updated = { ...r, status, history: [...(r.history || []), entry], updatedAt: new Date().toISOString() };
+        return updated;
       });
       saveRecords(next);
-      if (apiKey) pushRemoteRecords(apiKey, next);
+      if (apiKey && updated) pushRemoteRecord(apiKey, updated);
       return next;
     });
   }
   function updateRecordNote(id, note) {
     setSavedReviews((all) => {
-      const next = all.map((r) => (r.id === id ? { ...r, reviewerNote: note, updatedAt: new Date().toISOString() } : r));
+      let updated = null;
+      const next = all.map((r) => {
+        if (r.id !== id) return r;
+        updated = { ...r, reviewerNote: note, updatedAt: new Date().toISOString() };
+        return updated;
+      });
       saveRecords(next);
-      if (apiKey) pushRemoteRecords(apiKey, next);
+      if (apiKey && updated) pushRemoteRecord(apiKey, updated);
       return next;
     });
   }
@@ -1868,15 +1905,20 @@ export default function App() {
     setSavedReviews((all) => {
       const next = all.filter((r) => r.id !== id);
       saveRecords(next);
-      if (apiKey) pushRemoteRecords(apiKey, next);
+      if (apiKey) deleteRemoteRecord(apiKey, id);
       return next;
     });
   }
   function addLetterToRecord(id, letter) {
     setSavedReviews((all) => {
-      const next = all.map((r) => (r.id === id ? { ...r, letters: [...(r.letters || []), letter], updatedAt: new Date().toISOString() } : r));
+      let updated = null;
+      const next = all.map((r) => {
+        if (r.id !== id) return r;
+        updated = { ...r, letters: [...(r.letters || []), letter], updatedAt: new Date().toISOString() };
+        return updated;
+      });
       saveRecords(next);
-      if (apiKey) pushRemoteRecords(apiKey, next);
+      if (apiKey && updated) pushRemoteRecord(apiKey, updated);
       return next;
     });
   }
