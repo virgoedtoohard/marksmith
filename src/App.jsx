@@ -19,8 +19,7 @@ const fontsCSS = `@import url('https://fonts.googleapis.com/css2?family=Fraunces
 // Fill this in after you deploy the worker/ folder — see worker/README or
 // the deployment instructions you were given. Example:
 // "https://marksmith-proxy.yourname.workers.dev"
-const WORKER_URL = "https://REPLACE-WITH-YOUR-WORKER-URL.workers.dev";
-
+   const WORKER_URL = "https://marksmith-proxy.virgoedtoohard.workers.dev";
 // ============ SETTINGS STORAGE ============
 const STORAGE_KEY = "marksmith:apiKey"; // now holds a signed session token, not a raw Anthropic key
 const ORG_KEY = "marksmith:org";
