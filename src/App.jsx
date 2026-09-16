@@ -24,13 +24,10 @@ const WORKER_URL = "https://marksmith-proxy.virgoedtoohard.workers.dev";
 // ============ SETTINGS STORAGE ============
 const STORAGE_KEY = "marksmith:apiKey"; // now holds a signed session token, not a raw Anthropic key
 const ORG_KEY = "marksmith:org";
-const MODEL_KEY = "marksmith:model";
+// The model is fixed by the site, not chosen by organizations — update this
+// constant when a better default becomes available. Everything in the app
+// calls Claude through this single value.
 const DEFAULT_MODEL = "claude-sonnet-4-5-20250929";
-const MODELS = [
-  { id: "claude-sonnet-4-5-20250929", label: "Claude Sonnet 4.5 (recommended)" },
-  { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5 (cheaper, faster)" },
-  { id: "claude-opus-4-5-20250929", label: "Claude Opus 4.5 (highest quality, slower)" },
-];
 
 function loadApiKey() {
   try { return localStorage.getItem(STORAGE_KEY) || ""; } catch { return ""; }
@@ -43,12 +40,6 @@ function loadOrgName() {
 }
 function saveOrgName(v) {
   try { if (v) localStorage.setItem(ORG_KEY, v); else localStorage.removeItem(ORG_KEY); } catch {}
-}
-function loadModel() {
-  try { return localStorage.getItem(MODEL_KEY) || DEFAULT_MODEL; } catch { return DEFAULT_MODEL; }
-}
-function saveModel(v) {
-  try { localStorage.setItem(MODEL_KEY, v); } catch {}
 }
 const RUBRIC_KEY = "marksmith:rubric";
 function loadRubric() {
@@ -103,6 +94,7 @@ function makeRecord({ parsed, label, application, rubricSnapshot, source }) {
     status: "pending",
     reviewerNote: "",
     timestamp: new Date().toISOString(),
+    history: [],
   };
 }
 const STATUS_OPTIONS = [
@@ -113,6 +105,66 @@ const STATUS_OPTIONS = [
   { id: "declined", label: "Declined", color: bad },
 ];
 function statusMeta(id) { return STATUS_OPTIONS.find((s) => s.id === id) || STATUS_OPTIONS[0]; }
+
+// ============ RECORDS EXPORT (CSV + bulk application download) ============
+function csvEscape(value) {
+  const s = String(value ?? "");
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+function exportRecordsCSV(records) {
+  const headers = ["Label", "Status", "Score", "Max", "Percent", "Source", "Date", "Reviewer note"];
+  const rows = records.map((r) => {
+    const pct = r.totalMax > 0 ? Math.round(((r.totalPoints || 0) / r.totalMax) * 100) : "";
+    return [
+      r.label, statusMeta(r.status || "pending").label, r.totalPoints ?? "", r.totalMax ?? "", pct,
+      r.source === "compare" ? "Compare" : "Review", new Date(r.timestamp).toLocaleString(), r.reviewerNote || "",
+    ];
+  });
+  const csv = [headers, ...rows].map((row) => row.map(csvEscape).join(",")).join("\n");
+  downloadBlob(new Blob([csv], { type: "text/csv;charset=utf-8" }), `marksmith-records-${new Date().toISOString().slice(0, 10)}.csv`);
+}
+function safeFileName(s) {
+  return (s || "application").replace(/[^a-zA-Z0-9-_ ]/g, "").trim().slice(0, 60) || "application";
+}
+// Loaded on demand — not bundled — so a plain export/CSV site never pays for it.
+let jszipPromise = null;
+function loadJSZip() {
+  if (!jszipPromise) {
+    jszipPromise = import(/* @vite-ignore */ "https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm").then((m) => m.default || m);
+  }
+  return jszipPromise;
+}
+async function downloadApplicationsZip(records) {
+  const withFiles = records.filter((r) => r.application && (r.application.fileBlock || r.application.text));
+  if (withFiles.length === 0) throw new Error("None of these records have a stored application to download.");
+  const JSZip = await loadJSZip();
+  const zip = new JSZip();
+  const usedNames = new Set();
+  withFiles.forEach((r) => {
+    const base = safeFileName(r.label);
+    let name = base, n = 1;
+    while (usedNames.has(name)) { name = `${base}-${++n}`; }
+    usedNames.add(name);
+    const { fileBlock, fileName, text } = r.application;
+    if (fileBlock?.type === "document") {
+      zip.file(`${name}.pdf`, fileBlock.source.data, { base64: true });
+    } else if (fileBlock?.type === "image") {
+      const ext = (fileBlock.source.media_type || "").split("/")[1]?.split("+")[0] || "jpg";
+      zip.file(`${name}.${ext}`, fileBlock.source.data, { base64: true });
+    } else if (text) {
+      zip.file(`${name}.txt`, text);
+    }
+  });
+  const blob = await zip.generateAsync({ type: "blob" });
+  downloadBlob(blob, `marksmith-applications-${new Date().toISOString().slice(0, 10)}.zip`);
+}
 
 // ============ HELPERS ============
 function fileToBase64(file) {
@@ -156,9 +208,22 @@ async function fileToContentBlock(file) {
 
 const FILE_ACCEPT = "application/pdf,image/*,text/plain,text/markdown,.txt,.md";
 
+// Shared: turn Claude's rubric JSON into the {id, name, description, maxPoints} shape.
+function parseRubricCriteria(raw, notFoundMessage) {
+  const parsed = JSON.parse(cleanJSON(raw));
+  const criteria = Array.isArray(parsed.criteria) ? parsed.criteria : [];
+  if (criteria.length === 0) throw new Error(notFoundMessage);
+  return criteria.map((c, i) => ({
+    id: i + 1,
+    name: c.name || `Criterion ${i + 1}`,
+    description: c.description || "",
+    maxPoints: Number(c.maxPoints) || 0,
+  }));
+}
+
 // Reads a rubric document (PDF, photo, or text) and asks Claude to turn it
 // into structured criteria the rest of the tool can score against.
-async function extractRubricFromFile(file, apiKey, model) {
+async function extractRubricFromFile(file, apiKey) {
   const instruction = "This file contains a scoring rubric used to review applications (e.g. for a scholarship or grant). Read it carefully and convert it into structured scoring criteria.";
   const system = `You convert rubric documents into structured JSON for a review tool.
 
@@ -177,16 +242,27 @@ Respond with ONLY valid JSON, no markdown, no preamble:
     ? [block, { type: "text", text: instruction }]
     : `${instruction}\n\nRUBRIC DOCUMENT:\n\n${await readFileAsText(file)}`;
 
-  const raw = await callClaude(apiKey, model, system, userContent, 1500);
-  const parsed = JSON.parse(cleanJSON(raw));
-  const criteria = Array.isArray(parsed.criteria) ? parsed.criteria : [];
-  if (criteria.length === 0) throw new Error("Could not find any scoring criteria in that file.");
-  return criteria.map((c, i) => ({
-    id: i + 1,
-    name: c.name || `Criterion ${i + 1}`,
-    description: c.description || "",
-    maxPoints: Number(c.maxPoints) || 0,
-  }));
+  const raw = await callClaude(apiKey, DEFAULT_MODEL, system, userContent, 1500);
+  return parseRubricCriteria(raw, "Could not find any scoring criteria in that file.");
+}
+
+// Turns a plain-language description into the same structured rubric shape,
+// for reviewers who'd rather describe what they want than upload a document.
+async function generateRubricFromDescription(description, apiKey) {
+  const system = `You create structured scoring rubrics for a review tool, based on a plain-language description from the person building it.
+
+Rules:
+- Turn the description into distinct, non-overlapping scoring criteria.
+- Write a one-sentence description of what each criterion measures.
+- If the description gives explicit weights or point values, use those.
+- If it doesn't, assign sensible maxPoints per criterion so the total sums to 100, weighted by how much emphasis the description gives each one.
+- Produce between 2 and 8 criteria. Do not invent criteria unrelated to the description.
+
+Respond with ONLY valid JSON, no markdown, no preamble:
+{ "criteria": [{ "name": "string", "description": "string", "maxPoints": number }] }`;
+
+  const raw = await callClaude(apiKey, DEFAULT_MODEL, system, `Build a rubric from this description:\n\n${description}`, 1200);
+  return parseRubricCriteria(raw, "Could not turn that description into criteria — try adding a bit more detail.");
 }
 
 async function callClaude(apiKey, model, system, userContent, maxTokens = 2000) {
@@ -438,7 +514,7 @@ function Stat({ n, label }) {
 }
 
 // ============ TOOL I: REVIEW ============
-function ReviewTool({ apiKey, model, rubric, onSaveReview, onNav }) {
+function ReviewTool({ apiKey, rubric, onSaveReview, onNav }) {
   const [applicationText, setApplicationText] = useState("");
   const [fileBlock, setFileBlock] = useState(null);
   const [fileName, setFileName] = useState("");
@@ -492,7 +568,7 @@ Respond with ONLY valid JSON (no markdown, no preamble):
       : `Please review this scholarship application against the rubric:\n\n${applicationText}`;
 
     try {
-      const text = await callClaude(apiKey, model, system, userContent, 2000);
+      const text = await callClaude(apiKey, DEFAULT_MODEL, system, userContent, 2000);
       const parsed = JSON.parse(cleanJSON(text));
       const record = makeRecord({
         parsed,
@@ -670,7 +746,7 @@ function ReviewOutput({ result }) {
 }
 
 // ============ TOOL II: COMPARE ============
-function CompareTool({ apiKey, model, rubric, onSaveReview, onNav }) {
+function CompareTool({ apiKey, rubric, onSaveReview, onNav }) {
   const [applicants, setApplicants] = useState([{ id: 1, label: "", text: "", fileBlock: null, fileName: "" }]);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -724,7 +800,7 @@ function CompareTool({ apiKey, model, rubric, onSaveReview, onNav }) {
     if (!apiKey) return setCustomRubricError("You're not signed in. Open Settings first.");
     setCustomRubricLoading(true); setCustomRubricError(null);
     try {
-      const criteria = await extractRubricFromFile(file, apiKey, model);
+      const criteria = await extractRubricFromFile(file, apiKey);
       setCustomRubric(criteria);
       setCustomRubricFileName(file.name);
     } catch (err) {
@@ -770,7 +846,7 @@ Respond with ONLY valid JSON:
         const userContent = a.fileBlock
           ? [a.fileBlock, { type: "text", text: "Please review this scholarship application:" }]
           : `Please review this scholarship application:\n\n${a.text}`;
-        const text = await callClaude(apiKey, model, system, userContent, 2000);
+        const text = await callClaude(apiKey, DEFAULT_MODEL, system, userContent, 2000);
         const parsed = JSON.parse(cleanJSON(text));
         const record = makeRecord({
           parsed,
@@ -952,10 +1028,13 @@ Respond with ONLY valid JSON:
 }
 
 // ============ TOOL III: RUBRIC ============
-function RubricBuilder({ rubric, setRubric, apiKey, model, onNav }) {
+function RubricBuilder({ rubric, setRubric, apiKey, onNav }) {
   const totalMax = useMemo(() => rubric.reduce((s, c) => s + Number(c.maxPoints || 0), 0), [rubric]);
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState(null);
+  const [description, setDescription] = useState("");
+  const [describing, setDescribing] = useState(false);
+  const [describeError, setDescribeError] = useState(null);
 
   function updateCriterion(id, patch) { setRubric((cs) => cs.map((c) => (c.id === id ? { ...c, ...patch } : c))); }
   function removeCriterion(id) { setRubric((cs) => cs.filter((c) => c.id !== id)); }
@@ -972,7 +1051,7 @@ function RubricBuilder({ rubric, setRubric, apiKey, model, onNav }) {
     if (!apiKey) { setImportError("You're not signed in. Open Settings first."); return; }
     setImporting(true); setImportError(null);
     try {
-      const criteria = await extractRubricFromFile(file, apiKey, model);
+      const criteria = await extractRubricFromFile(file, apiKey);
       if (window.confirm(`Replace the current rubric with ${criteria.length} criteria parsed from "${file.name}"?`)) {
         setRubric(criteria);
       }
@@ -980,6 +1059,21 @@ function RubricBuilder({ rubric, setRubric, apiKey, model, onNav }) {
       setImportError(err.message || "Could not read that file.");
     } finally {
       setImporting(false);
+    }
+  }
+  async function handleDescribe() {
+    if (!apiKey) { setDescribeError("You're not signed in. Open Settings first."); return; }
+    if (!description.trim()) { setDescribeError("Describe what you'd like the rubric to score first."); return; }
+    setDescribing(true); setDescribeError(null);
+    try {
+      const criteria = await generateRubricFromDescription(description.trim(), apiKey);
+      if (window.confirm(`Replace the current rubric with ${criteria.length} criteria generated from your description?`)) {
+        setRubric(criteria);
+      }
+    } catch (err) {
+      setDescribeError(err.message || "Could not generate a rubric from that description.");
+    } finally {
+      setDescribing(false);
     }
   }
 
@@ -1030,7 +1124,29 @@ function RubricBuilder({ rubric, setRubric, apiKey, model, onNav }) {
       </div>
 
       <div style={{ marginTop: 48 }}>
-        <SectionLabel n="03" title="Current rubric" action={
+        <SectionLabel n="03" title="Describe it" action={<span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: muted, letterSpacing: "0.1em" }}>Plain language</span>}/>
+        {!apiKey && <div style={{ marginBottom: 16 }}><KeyBanner onNav={onNav}/></div>}
+        <div style={{ border: `1px solid ${rule}`, background: "#fff", padding: 20, borderRadius: 2 }}>
+          <p style={{ fontSize: 13, color: inkSoft, margin: "0 0 14px", lineHeight: 1.6 }}>
+            Not ready to build criteria by hand? Describe what you want the rubric to reward — in your own words — and it'll be turned into scored criteria below, replacing the current rubric.
+          </p>
+          <textarea value={description} onChange={(e) => setDescription(e.target.value)}
+            placeholder="e.g. Weight financial need heavily, give real credit for community service, and a smaller amount for grades — this is a need-based scholarship, not a merit one."
+            disabled={describing}
+            style={{ width: "100%", boxSizing: "border-box", border: `1px solid ${rule}`, outline: "none",
+              padding: 14, minHeight: 90, resize: "vertical", background: paperDeep,
+              fontFamily: "'Inter', sans-serif", fontSize: 14, color: ink, lineHeight: 1.6, borderRadius: 2 }}/>
+          <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginTop: 12 }}>
+            <button onClick={handleDescribe} disabled={!apiKey || describing} style={{ ...ghostBtn, cursor: apiKey && !describing ? "pointer" : "not-allowed", opacity: apiKey && !describing ? 1 : 0.5 }}>
+              {describing ? "Generating…" : "Generate rubric"}
+            </button>
+            {describeError && <span style={{ color: warn, fontSize: 13 }}>{describeError}</span>}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 48 }}>
+        <SectionLabel n="04" title="Current rubric" action={
           <div style={{ fontFamily: "'Fraunces', serif", fontSize: 24, color: bronze }}>
             {totalMax}<span style={{ color: muted, fontSize: 14 }}> pts total</span>
           </div>
@@ -1121,6 +1237,20 @@ function RecordCard({ record, open, onToggle, onUpdateStatus, onUpdateNote, onDe
             <ReviewOutput result={record}/>
           </div>
           <div style={{ marginTop: 24 }}>
+            <SubHeading>Activity</SubHeading>
+            {record.history && record.history.length > 0 ? (
+              <div style={{ fontSize: 13, color: inkSoft, lineHeight: 1.8 }}>
+                {record.history.slice().reverse().map((h, i) => (
+                  <div key={i}>
+                    Marked <strong style={{ color: statusMeta(h.status).color }}>{statusMeta(h.status).label}</strong> — {new Date(h.changedAt).toLocaleString()}{h.changedBy ? ` by ${h.changedBy}` : ""}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div style={{ fontSize: 13, color: muted }}>Still at its default status — no changes logged yet.</div>
+            )}
+          </div>
+          <div style={{ marginTop: 24 }}>
             <SubHeading>Reviewer note</SubHeading>
             <textarea key={record.id} defaultValue={record.reviewerNote || ""} onBlur={(e) => onUpdateNote(record.id, e.target.value)}
               placeholder="Private notes for your committee — not shared with the applicant…"
@@ -1135,24 +1265,51 @@ function RecordCard({ record, open, onToggle, onUpdateStatus, onUpdateNote, onDe
 function RecordsPage({ records, onUpdateStatus, onUpdateNote, onDelete }) {
   const [openId, setOpenId] = useState(null);
   const [filter, setFilter] = useState("all");
+  const [zipping, setZipping] = useState(false);
+  const [zipError, setZipError] = useState(null);
   const filtered = filter === "all" ? records : records.filter((r) => (r.status || "pending") === filter);
   const sorted = [...filtered].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+  async function handleDownloadZip() {
+    setZipping(true); setZipError(null);
+    try {
+      await downloadApplicationsZip(sorted);
+    } catch (err) {
+      setZipError(err.message || "Could not build the zip file.");
+    } finally {
+      setZipping(false);
+    }
+  }
 
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto", padding: "40px 32px 80px" }}>
       <PageHeader eyebrow="Records" title="Application records" desc="Every application you've reviewed, with its score and decision status — kept in this browser."/>
 
-      <div style={{ marginTop: 32, display: "flex", gap: 8, flexWrap: "wrap" }}>
-        <button onClick={() => setFilter("all")} style={{ ...ghostBtn, background: filter === "all" ? paperDeep : "transparent", fontWeight: filter === "all" ? 600 : 400 }}>All ({records.length})</button>
-        {STATUS_OPTIONS.map((s) => {
-          const count = records.filter((r) => (r.status || "pending") === s.id).length;
-          return (
-            <button key={s.id} onClick={() => setFilter(s.id)} style={{ ...ghostBtn, background: filter === s.id ? paperDeep : "transparent", fontWeight: filter === s.id ? 600 : 400, color: s.color }}>
-              {s.label} ({count})
-            </button>
-          );
-        })}
+      <div style={{ marginTop: 32, display: "flex", gap: 12, flexWrap: "wrap", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button onClick={() => setFilter("all")} style={{ ...ghostBtn, background: filter === "all" ? paperDeep : "transparent", fontWeight: filter === "all" ? 600 : 400 }}>All ({records.length})</button>
+          {STATUS_OPTIONS.map((s) => {
+            const count = records.filter((r) => (r.status || "pending") === s.id).length;
+            return (
+              <button key={s.id} onClick={() => setFilter(s.id)} style={{ ...ghostBtn, background: filter === s.id ? paperDeep : "transparent", fontWeight: filter === s.id ? 600 : 400, color: s.color }}>
+                {s.label} ({count})
+              </button>
+            );
+          })}
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <button onClick={() => exportRecordsCSV(sorted)} disabled={sorted.length === 0}
+            style={{ ...ghostBtn, opacity: sorted.length ? 1 : 0.5, cursor: sorted.length ? "pointer" : "not-allowed" }}>
+            Export CSV
+          </button>
+          <button onClick={handleDownloadZip} disabled={zipping || sorted.length === 0}
+            style={{ ...ghostBtn, opacity: sorted.length && !zipping ? 1 : 0.5, cursor: sorted.length && !zipping ? "pointer" : "not-allowed" }}>
+            {zipping ? "Zipping…" : "Download applications"}
+          </button>
+          {zipError && <span style={{ color: warn, fontSize: 13 }}>{zipError}</span>}
+        </div>
       </div>
+      <div style={{ marginTop: 6, fontSize: 12, color: muted }}>Both actions apply to the current filter ({sorted.length} record{sorted.length === 1 ? "" : "s"}).</div>
 
       <div style={{ marginTop: 24 }}>
         {sorted.length === 0 && (
@@ -1172,7 +1329,7 @@ function RecordsPage({ records, onUpdateStatus, onUpdateNote, onDelete }) {
 }
 
 // ============ TOOL IV: FEEDBACK ============
-function FeedbackComposer({ apiKey, model, savedReviews, onNav }) {
+function FeedbackComposer({ apiKey, savedReviews, onNav }) {
   const [selectedIdx, setSelectedIdx] = useState(savedReviews.length > 0 ? 0 : -1);
   const [decision, setDecision] = useState("awarded");
   const [tone, setTone] = useState("warm");
@@ -1220,7 +1377,7 @@ Key facts from the application:
 ${(selected.keyFacts || []).map((f) => `- ${f}`).join("\n")}`;
 
     try {
-      const text = await callClaude(apiKey, model, system, userMsg, 1500);
+      const text = await callClaude(apiKey, DEFAULT_MODEL, system, userMsg, 1500);
       setLetter(text.trim());
     } catch (err) { setError(err.message); }
     finally { setGenerating(false); }
@@ -1337,7 +1494,7 @@ ${(selected.keyFacts || []).map((f) => `- ${f}`).join("\n")}`;
 }
 
 // ============ SETTINGS ============
-function Settings({ apiKey, setApiKey, orgName, setOrgName, model, setModel }) {
+function Settings({ apiKey, setApiKey, orgName, setOrgName }) {
   const [code, setCode] = useState("");
   const [password, setPassword] = useState("");
   const [signingIn, setSigningIn] = useState(false);
@@ -1402,21 +1559,6 @@ function Settings({ apiKey, setApiKey, orgName, setOrgName, model, setModel }) {
           </div>
         )}
 
-      </div>
-
-      <div style={{ marginTop: 48 }}>
-        <SubHeading>Model</SubHeading>
-        <div style={{ border: `1px solid ${rule}`, background: "#fff", borderRadius: 2 }}>
-          {MODELS.map((m, i) => (
-            <label key={m.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 20px", borderTop: i === 0 ? "none" : `1px solid ${rule}`, cursor: "pointer" }}>
-              <input type="radio" name="model" value={m.id} checked={model === m.id} onChange={(e) => setModel(e.target.value)}/>
-              <div>
-                <div style={{ fontFamily: "'Fraunces', serif", fontSize: 16 }}>{m.label}</div>
-                <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: muted, letterSpacing: "0.06em", marginTop: 2 }}>{m.id}</div>
-              </div>
-            </label>
-          ))}
-        </div>
       </div>
     </div>
   );
@@ -1489,11 +1631,9 @@ export default function App() {
   const [savedReviews, setSavedReviews] = useState(loadRecords());
   const [apiKey, setApiKeyState] = useState(loadApiKey());
   const [orgName, setOrgNameState] = useState(loadOrgName());
-  const [model, setModelState] = useState(loadModel());
 
   function setApiKey(v) { setApiKeyState(v); saveApiKey(v); }
   function setOrgName(v) { setOrgNameState(v); saveOrgName(v); }
-  function setModel(v) { setModelState(v); saveModel(v); }
   function setRubric(updater) {
     setRubricState((prev) => {
       const next = typeof updater === "function" ? updater(prev) : updater;
@@ -1502,7 +1642,17 @@ export default function App() {
     });
   }
   function handleSaveReview(r) { setSavedReviews((all) => { const next = [r, ...all]; saveRecords(next); return next; }); }
-  function updateRecordStatus(id, status) { setSavedReviews((all) => { const next = all.map((r) => (r.id === id ? { ...r, status } : r)); saveRecords(next); return next; }); }
+  function updateRecordStatus(id, status) {
+    setSavedReviews((all) => {
+      const next = all.map((r) => {
+        if (r.id !== id) return r;
+        const entry = { status, changedAt: new Date().toISOString(), changedBy: orgName || "Unknown organization" };
+        return { ...r, status, history: [...(r.history || []), entry] };
+      });
+      saveRecords(next);
+      return next;
+    });
+  }
   function updateRecordNote(id, note) { setSavedReviews((all) => { const next = all.map((r) => (r.id === id ? { ...r, reviewerNote: note } : r)); saveRecords(next); return next; }); }
   function deleteRecord(id) { setSavedReviews((all) => { const next = all.filter((r) => r.id !== id); saveRecords(next); return next; }); }
 
@@ -1513,12 +1663,12 @@ export default function App() {
       <style>{fontsCSS}</style>
       <Nav current={page} onNav={setPage} hasKey={hasKey}/>
       {page === "home" && <Home onNav={setPage} reviewCount={savedReviews.length} rubric={rubric} hasKey={hasKey}/>}
-      {page === "review" && <ReviewTool apiKey={apiKey} model={model} rubric={rubric} onSaveReview={handleSaveReview} onNav={setPage}/>}
-      {page === "compare" && <CompareTool apiKey={apiKey} model={model} rubric={rubric} onSaveReview={handleSaveReview} onNav={setPage}/>}
-      {page === "rubric" && <RubricBuilder rubric={rubric} setRubric={setRubric} apiKey={apiKey} model={model} onNav={setPage}/>}
-      {page === "feedback" && <FeedbackComposer apiKey={apiKey} model={model} savedReviews={savedReviews} onNav={setPage}/>}
+      {page === "review" && <ReviewTool apiKey={apiKey} rubric={rubric} onSaveReview={handleSaveReview} onNav={setPage}/>}
+      {page === "compare" && <CompareTool apiKey={apiKey} rubric={rubric} onSaveReview={handleSaveReview} onNav={setPage}/>}
+      {page === "rubric" && <RubricBuilder rubric={rubric} setRubric={setRubric} apiKey={apiKey} onNav={setPage}/>}
+      {page === "feedback" && <FeedbackComposer apiKey={apiKey} savedReviews={savedReviews} onNav={setPage}/>}
       {page === "records" && <RecordsPage records={savedReviews} onUpdateStatus={updateRecordStatus} onUpdateNote={updateRecordNote} onDelete={deleteRecord}/>}
-      {page === "settings" && <Settings apiKey={apiKey} setApiKey={setApiKey} orgName={orgName} setOrgName={setOrgName} model={model} setModel={setModel}/>}
+      {page === "settings" && <Settings apiKey={apiKey} setApiKey={setApiKey} orgName={orgName} setOrgName={setOrgName}/>}
       {page === "about" && <About/>}
       <Footer/>
     </div>
