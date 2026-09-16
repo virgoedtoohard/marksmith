@@ -19,7 +19,8 @@ const fontsCSS = `@import url('https://fonts.googleapis.com/css2?family=Fraunces
 // Fill this in after you deploy the worker/ folder — see worker/README or
 // the deployment instructions you were given. Example:
 // "https://marksmith-proxy.yourname.workers.dev"
-   const WORKER_URL = "https://marksmith-proxy.virgoedtoohard.workers.dev";
+const WORKER_URL = "https://marksmith-proxy.virgoedtoohard.workers.dev";
+
 // ============ SETTINGS STORAGE ============
 const STORAGE_KEY = "marksmith:apiKey"; // now holds a signed session token, not a raw Anthropic key
 const ORG_KEY = "marksmith:org";
@@ -61,6 +62,68 @@ function fileToBase64(file) {
 }
 function cleanJSON(text) {
   return text.replace(/```json/gi, "").replace(/```/g, "").trim();
+}
+
+// ============ FILE HANDLING (PDF / photo / text) ============
+function isPdfFile(file) { return file.type === "application/pdf"; }
+function isImageFile(file) { return /^image\//.test(file.type); }
+
+function readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(new Error("Could not read file"));
+    r.readAsText(file);
+  });
+}
+
+// Returns a Claude content block for PDFs/images, or null for anything else
+// (caller should fall back to readFileAsText for plain text/markdown files).
+async function fileToContentBlock(file) {
+  if (isPdfFile(file)) {
+    const b64 = await fileToBase64(file);
+    return { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } };
+  }
+  if (isImageFile(file)) {
+    const b64 = await fileToBase64(file);
+    return { type: "image", source: { type: "base64", media_type: file.type || "image/jpeg", data: b64 } };
+  }
+  return null;
+}
+
+const FILE_ACCEPT = "application/pdf,image/*,text/plain,text/markdown,.txt,.md";
+
+// Reads a rubric document (PDF, photo, or text) and asks Claude to turn it
+// into structured criteria the rest of the tool can score against.
+async function extractRubricFromFile(file, apiKey, model) {
+  const instruction = "This file contains a scoring rubric used to review applications (e.g. for a scholarship or grant). Read it carefully and convert it into structured scoring criteria.";
+  const system = `You convert rubric documents into structured JSON for a review tool.
+
+Rules:
+- Use the exact or closest criterion names from the source document.
+- Write a one-sentence description of what each criterion measures, based on the source.
+- If the source gives explicit point values per criterion, use those exactly.
+- If it doesn't give explicit points, assign sensible maxPoints per criterion so the total sums to 100, weighted by how much emphasis the source gives each one.
+- Do not invent criteria that aren't in the source. Do not merge unrelated criteria together.
+
+Respond with ONLY valid JSON, no markdown, no preamble:
+{ "criteria": [{ "name": "string", "description": "string", "maxPoints": number }] }`;
+
+  const block = await fileToContentBlock(file);
+  const userContent = block
+    ? [block, { type: "text", text: instruction }]
+    : `${instruction}\n\nRUBRIC DOCUMENT:\n\n${await readFileAsText(file)}`;
+
+  const raw = await callClaude(apiKey, model, system, userContent, 1500);
+  const parsed = JSON.parse(cleanJSON(raw));
+  const criteria = Array.isArray(parsed.criteria) ? parsed.criteria : [];
+  if (criteria.length === 0) throw new Error("Could not find any scoring criteria in that file.");
+  return criteria.map((c, i) => ({
+    id: i + 1,
+    name: c.name || `Criterion ${i + 1}`,
+    description: c.description || "",
+    maxPoints: Number(c.maxPoints) || 0,
+  }));
 }
 
 async function callClaude(apiKey, model, system, userContent, maxTokens = 2000) {
@@ -313,8 +376,8 @@ function Stat({ n, label }) {
 // ============ TOOL I: REVIEW ============
 function ReviewTool({ apiKey, model, rubric, onSaveReview, onNav }) {
   const [applicationText, setApplicationText] = useState("");
-  const [pdfBase64, setPdfBase64] = useState(null);
-  const [pdfName, setPdfName] = useState("");
+  const [fileBlock, setFileBlock] = useState(null);
+  const [fileName, setFileName] = useState("");
   const [applicantLabel, setApplicantLabel] = useState("");
   const [analyzing, setAnalyzing] = useState(false);
   const [result, setResult] = useState(null);
@@ -323,17 +386,18 @@ function ReviewTool({ apiKey, model, rubric, onSaveReview, onNav }) {
 
   async function handleFile(e) {
     const file = e.target.files?.[0];
+    e.target.value = "";
     if (!file) return;
-    if (file.type !== "application/pdf") return setError("Please upload a PDF, or paste the text instead.");
     try {
-      const b64 = await fileToBase64(file);
-      setPdfBase64(b64); setPdfName(file.name); setApplicationText(""); setError(null);
+      const block = await fileToContentBlock(file);
+      if (!block) return setError("That file type isn't a PDF or photo — paste the text instead.");
+      setFileBlock(block); setFileName(file.name); setApplicationText(""); setError(null);
     } catch (err) { setError(err.message); }
   }
 
   async function analyze() {
-    if (!apiKey) return setError("Add an API key in Settings first.");
-    if (!pdfBase64 && !applicationText.trim()) return setError("Paste an application or upload a PDF first.");
+    if (!apiKey) return setError("You're not signed in. Open Settings first.");
+    if (!fileBlock && !applicationText.trim()) return setError("Paste an application, or upload a PDF/photo, first.");
     if (rubric.length === 0) return setError("Add criteria in the Rubric tool.");
     setAnalyzing(true); setError(null); setResult(null);
 
@@ -359,11 +423,8 @@ Respond with ONLY valid JSON (no markdown, no preamble):
   "overallImpression": "1-2 sentences"
 }`;
 
-    const userContent = pdfBase64
-      ? [
-          { type: "document", source: { type: "base64", media_type: "application/pdf", data: pdfBase64 } },
-          { type: "text", text: "Please review this scholarship application against the rubric." },
-        ]
+    const userContent = fileBlock
+      ? [fileBlock, { type: "text", text: "Please review this scholarship application against the rubric." }]
       : `Please review this scholarship application against the rubric:\n\n${applicationText}`;
 
     try {
@@ -378,7 +439,7 @@ Respond with ONLY valid JSON (no markdown, no preamble):
 
   function reset() {
     setResult(null); setError(null); setApplicationText("");
-    setPdfBase64(null); setPdfName(""); setApplicantLabel("");
+    setFileBlock(null); setFileName(""); setApplicantLabel("");
   }
 
   return (
@@ -392,13 +453,13 @@ Respond with ONLY valid JSON (no markdown, no preamble):
             placeholder="Optional label (e.g. 'Jane Doe — nursing')"
             style={{ ...editInput, marginBottom: 12, background: "#fff" }}/>
           <div style={{ border: `1px solid ${rule}`, background: "#fff", borderRadius: 2 }}>
-            {pdfBase64 ? (
+            {fileBlock ? (
               <div style={{ padding: 20, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                 <div>
-                  <div style={{ fontSize: 12, color: muted, fontFamily: "'JetBrains Mono', monospace", textTransform: "uppercase", letterSpacing: "0.1em" }}>PDF loaded</div>
-                  <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, marginTop: 4 }}>{pdfName}</div>
+                  <div style={{ fontSize: 12, color: muted, fontFamily: "'JetBrains Mono', monospace", textTransform: "uppercase", letterSpacing: "0.1em" }}>{fileBlock.type === "document" ? "PDF loaded" : "Photo loaded"}</div>
+                  <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, marginTop: 4 }}>{fileName}</div>
                 </div>
-                <button onClick={() => { setPdfBase64(null); setPdfName(""); }} style={ghostBtn}>Remove</button>
+                <button onClick={() => { setFileBlock(null); setFileName(""); }} style={ghostBtn}>Remove</button>
               </div>
             ) : (
               <textarea value={applicationText} onChange={(e) => setApplicationText(e.target.value)}
@@ -409,11 +470,11 @@ Respond with ONLY valid JSON (no markdown, no preamble):
             )}
             <div style={{ borderTop: `1px solid ${rule}`, padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", background: paperDeep }}>
               <label style={{ cursor: "pointer", fontSize: 13, color: inkSoft }}>
-                <input type="file" accept="application/pdf" onChange={handleFile} style={{ display: "none" }}/>
-                <span style={{ borderBottom: `1px solid ${bronze}`, color: bronze, fontWeight: 500 }}>Upload PDF instead</span>
+                <input type="file" accept={FILE_ACCEPT} onChange={handleFile} style={{ display: "none" }}/>
+                <span style={{ borderBottom: `1px solid ${bronze}`, color: bronze, fontWeight: 500 }}>Upload PDF or photo instead</span>
               </label>
               <span style={{ fontSize: 12, color: muted, fontFamily: "'JetBrains Mono', monospace" }}>
-                {pdfBase64 ? "PDF" : `${applicationText.length} chars`}
+                {fileBlock ? (fileBlock.type === "document" ? "PDF" : "Photo") : `${applicationText.length} chars`}
               </span>
             </div>
           </div>
@@ -540,25 +601,77 @@ function ReviewOutput({ result }) {
 
 // ============ TOOL II: COMPARE ============
 function CompareTool({ apiKey, model, rubric, onSaveReview, onNav }) {
-  const [applicants, setApplicants] = useState([{ id: 1, label: "", text: "" }]);
+  const [applicants, setApplicants] = useState([{ id: 1, label: "", text: "", fileBlock: null, fileName: "" }]);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState(0);
   const [results, setResults] = useState([]);
   const [error, setError] = useState(null);
-  const totalMax = useMemo(() => rubric.reduce((s, c) => s + Number(c.maxPoints || 0), 0), [rubric]);
 
-  function addApplicant() { setApplicants((a) => [...a, { id: Math.max(0, ...a.map((x) => x.id)) + 1, label: "", text: "" }]); }
+  const [rubricMode, setRubricMode] = useState("site"); // "site" | "custom"
+  const [customRubric, setCustomRubric] = useState([]);
+  const [customRubricFileName, setCustomRubricFileName] = useState("");
+  const [customRubricLoading, setCustomRubricLoading] = useState(false);
+  const [customRubricError, setCustomRubricError] = useState(null);
+
+  const activeRubric = rubricMode === "custom" && customRubric.length > 0 ? customRubric : rubric;
+  const totalMax = useMemo(() => activeRubric.reduce((s, c) => s + Number(c.maxPoints || 0), 0), [activeRubric]);
+
+  function addApplicant() { setApplicants((a) => [...a, { id: Math.max(0, ...a.map((x) => x.id)) + 1, label: "", text: "", fileBlock: null, fileName: "" }]); }
   function removeApplicant(id) { setApplicants((a) => a.filter((x) => x.id !== id)); }
   function updateApplicant(id, patch) { setApplicants((a) => a.map((x) => (x.id === id ? { ...x, ...patch } : x))); }
 
+  async function handleApplicantFile(id, file) {
+    try {
+      const block = await fileToContentBlock(file);
+      if (block) updateApplicant(id, { fileBlock: block, fileName: file.name, text: "" });
+      else updateApplicant(id, { text: await readFileAsText(file), fileBlock: null, fileName: file.name });
+    } catch (err) {
+      setError(err.message || "Could not read that file.");
+    }
+  }
+
+  async function handleBulkFiles(fileList) {
+    const files = Array.from(fileList || []);
+    if (files.length === 0) return;
+    let nextId = Math.max(0, ...applicants.map((x) => x.id)) + 1;
+    const newOnes = [];
+    for (const file of files) {
+      const entry = { id: nextId++, label: file.name.replace(/\.[^.]+$/, ""), text: "", fileBlock: null, fileName: file.name };
+      try {
+        const block = await fileToContentBlock(file);
+        if (block) entry.fileBlock = block;
+        else entry.text = await readFileAsText(file);
+      } catch { /* leave entry empty; user can fix it inline */ }
+      newOnes.push(entry);
+    }
+    setApplicants((a) => {
+      const isBlank = a.length === 1 && !a[0].text && !a[0].fileBlock && !a[0].label;
+      return [...(isBlank ? [] : a), ...newOnes];
+    });
+  }
+
+  async function handleCustomRubricFile(file) {
+    if (!apiKey) return setCustomRubricError("You're not signed in. Open Settings first.");
+    setCustomRubricLoading(true); setCustomRubricError(null);
+    try {
+      const criteria = await extractRubricFromFile(file, apiKey, model);
+      setCustomRubric(criteria);
+      setCustomRubricFileName(file.name);
+    } catch (err) {
+      setCustomRubricError(err.message || "Could not read that rubric file.");
+    } finally {
+      setCustomRubricLoading(false);
+    }
+  }
+
   async function runAll() {
-    if (!apiKey) return setError("Add an API key in Settings first.");
-    const valid = applicants.filter((a) => a.text.trim().length > 30);
-    if (valid.length < 2) return setError("Add at least two applications (30+ chars each).");
-    if (rubric.length === 0) return setError("Add criteria in the Rubric tool first.");
+    if (!apiKey) return setError("You're not signed in. Open Settings first.");
+    const valid = applicants.filter((a) => a.fileBlock || a.text.trim().length > 30);
+    if (valid.length < 2) return setError("Add at least two applications — paste 30+ characters, or upload a file, for each.");
+    if (activeRubric.length === 0) return setError(rubricMode === "custom" ? "Upload a custom rubric first." : "Add criteria in the Rubric tool first.");
     setRunning(true); setError(null); setResults([]); setProgress(0);
 
-    const rubricText = rubric.map((c) => `- "${c.name}" (max ${c.maxPoints} pts): ${c.description}`).join("\n");
+    const rubricText = activeRubric.map((c) => `- "${c.name}" (max ${c.maxPoints} pts): ${c.description}`).join("\n");
     const system = `You are an experienced scholarship reviewer. Score this application against the rubric.
 
 RUBRIC:
@@ -567,7 +680,7 @@ Total possible: ${totalMax} points.
 
 Rules:
 - Score based only on evidence. Missing evidence = low score.
-- Be honest.
+- Be honest and objective — apply the same standard to every application so rankings are comparable.
 
 Respond with ONLY valid JSON:
 {
@@ -584,7 +697,10 @@ Respond with ONLY valid JSON:
     for (let i = 0; i < valid.length; i++) {
       const a = valid[i];
       try {
-        const text = await callClaude(apiKey, model, system, `Please review this scholarship application:\n\n${a.text}`, 2000);
+        const userContent = a.fileBlock
+          ? [a.fileBlock, { type: "text", text: "Please review this scholarship application:" }]
+          : `Please review this scholarship application:\n\n${a.text}`;
+        const text = await callClaude(apiKey, model, system, userContent, 2000);
         const parsed = JSON.parse(cleanJSON(text));
         const withLabel = { ...parsed, label: a.label || parsed.applicant?.name || `Applicant ${i + 1}`, timestamp: new Date().toISOString() };
         out.push(withLabel);
@@ -599,6 +715,7 @@ Respond with ONLY valid JSON:
   }
 
   const ranked = [...results].sort((a, b) => (b.totalPoints || 0) - (a.totalPoints || 0));
+  const validCount = applicants.filter((a) => a.fileBlock || a.text.trim().length > 30).length;
 
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto", padding: "40px 32px 80px" }}>
@@ -606,7 +723,56 @@ Respond with ONLY valid JSON:
       {!apiKey && <div style={{ marginTop: 24 }}><KeyBanner onNav={onNav}/></div>}
 
       <div style={{ marginTop: 40 }}>
-        <SectionLabel n="01" title="Applications" action={<button onClick={addApplicant} style={ghostBtn}>+ Add applicant</button>}/>
+        <SectionLabel n="01" title="Rubric"/>
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          <button onClick={() => setRubricMode("site")} style={{ ...ghostBtn, background: rubricMode === "site" ? paperDeep : "transparent", fontWeight: rubricMode === "site" ? 600 : 400 }}>Site rubric</button>
+          <button onClick={() => setRubricMode("custom")} style={{ ...ghostBtn, background: rubricMode === "custom" ? paperDeep : "transparent", fontWeight: rubricMode === "custom" ? 600 : 400 }}>Custom rubric for this batch</button>
+        </div>
+        {rubricMode === "site" ? (
+          <div style={{ fontSize: 13, color: muted }}>{rubric.length} criteria · {rubric.reduce((s, c) => s + Number(c.maxPoints || 0), 0)} pts — from the Rubric tool.</div>
+        ) : (
+          <div style={{ border: `1px solid ${rule}`, background: "#fff", padding: 20, borderRadius: 2 }}>
+            <p style={{ fontSize: 13, color: inkSoft, margin: "0 0 14px", lineHeight: 1.6 }}>
+              Upload a rubric just for this batch — a PDF, a photo, or a text file. It won't change the site's default rubric.
+            </p>
+            <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+              <label style={{ ...ghostBtn, display: "inline-block", cursor: apiKey && !customRubricLoading ? "pointer" : "not-allowed", opacity: apiKey && !customRubricLoading ? 1 : 0.5 }}>
+                <input type="file" accept={FILE_ACCEPT} disabled={!apiKey || customRubricLoading}
+                  onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) handleCustomRubricFile(f); }}
+                  style={{ display: "none" }}/>
+                {customRubricLoading ? "Reading…" : customRubric.length ? "Replace rubric file" : "Choose a rubric file"}
+              </label>
+              {customRubricFileName && !customRubricLoading && <span style={{ fontSize: 13, color: muted }}>{customRubricFileName}</span>}
+              {customRubricError && <span style={{ color: warn, fontSize: 13 }}>{customRubricError}</span>}
+            </div>
+            {customRubric.length > 0 && (
+              <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${rule}` }}>
+                <div style={{ fontSize: 12, color: muted, fontFamily: "'JetBrains Mono', monospace", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                  {customRubric.length} criteria parsed · {totalMax} pts
+                </div>
+                {customRubric.map((c) => (
+                  <div key={c.id} style={{ fontSize: 13, color: inkSoft, padding: "4px 0" }}>
+                    <strong style={{ color: ink }}>{c.name}</strong> — {c.description} <span style={{ color: bronze }}>({c.maxPoints} pts)</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div style={{ marginTop: 48 }}>
+        <SectionLabel n="02" title="Applications" action={
+          <div style={{ display: "flex", gap: 8 }}>
+            <label style={{ ...ghostBtn, display: "inline-block", cursor: "pointer" }}>
+              <input type="file" multiple accept={FILE_ACCEPT}
+                onChange={(e) => { handleBulkFiles(e.target.files); e.target.value = ""; }}
+                style={{ display: "none" }}/>
+              Upload multiple files
+            </label>
+            <button onClick={addApplicant} style={ghostBtn}>+ Add applicant</button>
+          </div>
+        }/>
         <div style={{ display: "grid", gap: 16 }}>
           {applicants.map((a, i) => (
             <div key={a.id} style={{ border: `1px solid ${rule}`, background: "#fff", borderRadius: 2 }}>
@@ -619,29 +785,47 @@ Respond with ONLY valid JSON:
                 </div>
                 {applicants.length > 1 && <button onClick={() => removeApplicant(a.id)} style={{ ...ghostBtn, color: warn }}>Remove</button>}
               </div>
-              <textarea value={a.text} onChange={(e) => updateApplicant(a.id, { text: e.target.value })}
-                placeholder="Paste this applicant's essay or full application…"
-                style={{ width: "100%", boxSizing: "border-box", border: "none", outline: "none",
-                  padding: 16, minHeight: 140, resize: "vertical", background: "transparent",
-                  fontFamily: "'Inter', sans-serif", fontSize: 14, color: ink, lineHeight: 1.6 }}/>
+              {a.fileBlock ? (
+                <div style={{ padding: 16, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <div style={{ fontSize: 13, color: inkSoft }}>{a.fileBlock.type === "document" ? "PDF" : "Photo"} loaded: {a.fileName}</div>
+                  <button onClick={() => updateApplicant(a.id, { fileBlock: null, fileName: "" })} style={ghostBtn}>Remove file</button>
+                </div>
+              ) : (
+                <textarea value={a.text} onChange={(e) => updateApplicant(a.id, { text: e.target.value })}
+                  placeholder="Paste this applicant's essay or full application…"
+                  style={{ width: "100%", boxSizing: "border-box", border: "none", outline: "none",
+                    padding: 16, minHeight: 140, resize: "vertical", background: "transparent",
+                    fontFamily: "'Inter', sans-serif", fontSize: 14, color: ink, lineHeight: 1.6 }}/>
+              )}
+              <div style={{ borderTop: `1px solid ${rule}`, padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", background: paperDeep }}>
+                <label style={{ cursor: "pointer", fontSize: 13, color: inkSoft }}>
+                  <input type="file" accept={FILE_ACCEPT}
+                    onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) handleApplicantFile(a.id, f); }}
+                    style={{ display: "none" }}/>
+                  <span style={{ borderBottom: `1px solid ${bronze}`, color: bronze, fontWeight: 500 }}>{a.fileBlock ? "Replace file" : "Upload file instead"}</span>
+                </label>
+                <span style={{ fontSize: 12, color: muted, fontFamily: "'JetBrains Mono', monospace" }}>
+                  {a.fileBlock ? (a.fileBlock.type === "document" ? "PDF" : "Photo") : `${a.text.length} chars`}
+                </span>
+              </div>
             </div>
           ))}
         </div>
 
         <div style={{ marginTop: 24, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <button onClick={runAll} disabled={running || !apiKey} style={primaryBtn(running || !apiKey)}>
-            {running ? `Reading… ${progress} / ${applicants.filter((a) => a.text.trim().length > 30).length}` : "Score all"}
+            {running ? `Reading… ${progress} / ${validCount}` : "Score all"}
           </button>
           {error && <span style={{ color: warn, fontSize: 13 }}>{error}</span>}
           <span style={{ fontSize: 12, color: muted, fontFamily: "'JetBrains Mono', monospace", marginLeft: "auto" }}>
-            Rubric: {rubric.length} criteria · {totalMax} pts
+            Rubric: {activeRubric.length} criteria · {totalMax} pts {rubricMode === "custom" ? "(custom)" : ""}
           </span>
         </div>
       </div>
 
       {results.length > 0 && (
         <div style={{ marginTop: 60 }}>
-          <SectionLabel n="02" title="Leaderboard"/>
+          <SectionLabel n="03" title="Leaderboard"/>
           <div style={{ border: `1px solid ${rule}`, background: "#fff", borderRadius: 2 }}>
             {ranked.map((r, i) => {
               const pct = r.totalMax > 0 ? Math.round(((r.totalPoints || 0) / r.totalMax) * 100) : 0;
@@ -692,8 +876,10 @@ Respond with ONLY valid JSON:
 }
 
 // ============ TOOL III: RUBRIC ============
-function RubricBuilder({ rubric, setRubric }) {
+function RubricBuilder({ rubric, setRubric, apiKey, model, onNav }) {
   const totalMax = useMemo(() => rubric.reduce((s, c) => s + Number(c.maxPoints || 0), 0), [rubric]);
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState(null);
 
   function updateCriterion(id, patch) { setRubric((cs) => cs.map((c) => (c.id === id ? { ...c, ...patch } : c))); }
   function removeCriterion(id) { setRubric((cs) => cs.filter((c) => c.id !== id)); }
@@ -704,6 +890,20 @@ function RubricBuilder({ rubric, setRubric }) {
   function loadTemplate(name) {
     if (window.confirm(`Replace the current rubric with the "${name}" template?`)) {
       setRubric(RUBRIC_TEMPLATES[name].map((c) => ({ ...c })));
+    }
+  }
+  async function handleImportFile(file) {
+    if (!apiKey) { setImportError("You're not signed in. Open Settings first."); return; }
+    setImporting(true); setImportError(null);
+    try {
+      const criteria = await extractRubricFromFile(file, apiKey, model);
+      if (window.confirm(`Replace the current rubric with ${criteria.length} criteria parsed from "${file.name}"?`)) {
+        setRubric(criteria);
+      }
+    } catch (err) {
+      setImportError(err.message || "Could not read that file.");
+    } finally {
+      setImporting(false);
     }
   }
 
@@ -735,7 +935,26 @@ function RubricBuilder({ rubric, setRubric }) {
       </div>
 
       <div style={{ marginTop: 48 }}>
-        <SectionLabel n="02" title="Current rubric" action={
+        <SectionLabel n="02" title="Import from a file" action={<span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: muted, letterSpacing: "0.1em" }}>PDF, photo, or text</span>}/>
+        {!apiKey && <div style={{ marginBottom: 16 }}><KeyBanner onNav={onNav}/></div>}
+        <div style={{ border: `1px solid ${rule}`, background: "#fff", padding: 20, borderRadius: 2 }}>
+          <p style={{ fontSize: 13, color: inkSoft, margin: "0 0 14px", lineHeight: 1.6 }}>
+            Have a rubric document from your organization? Upload it — a PDF, a photo of a printed page, or a plain text file — and it'll be read and converted into criteria below, replacing the current rubric.
+          </p>
+          <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+            <label style={{ ...ghostBtn, display: "inline-block", cursor: apiKey && !importing ? "pointer" : "not-allowed", opacity: apiKey && !importing ? 1 : 0.5 }}>
+              <input type="file" accept={FILE_ACCEPT} disabled={!apiKey || importing}
+                onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) handleImportFile(f); }}
+                style={{ display: "none" }}/>
+              {importing ? "Reading…" : "Choose a rubric file"}
+            </label>
+            {importError && <span style={{ color: warn, fontSize: 13 }}>{importError}</span>}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 48 }}>
+        <SectionLabel n="03" title="Current rubric" action={
           <div style={{ fontFamily: "'Fraunces', serif", fontSize: 24, color: bronze }}>
             {totalMax}<span style={{ color: muted, fontSize: 14 }}> pts total</span>
           </div>
@@ -786,7 +1005,7 @@ function FeedbackComposer({ apiKey, model, savedReviews, onNav }) {
   const selected = selectedIdx >= 0 && selectedIdx < savedReviews.length ? savedReviews[selectedIdx] : null;
 
   async function generate() {
-    if (!apiKey) return setError("Add an API key in Settings first.");
+    if (!apiKey) return setError("You're not signed in. Open Settings first.");
     if (!selected) return setError("Select a reviewed application first.");
     setGenerating(true); setError(null); setLetter("");
 
@@ -1104,7 +1323,7 @@ export default function App() {
       {page === "home" && <Home onNav={setPage} reviewCount={savedReviews.length} rubric={rubric} hasKey={hasKey}/>}
       {page === "review" && <ReviewTool apiKey={apiKey} model={model} rubric={rubric} onSaveReview={handleSaveReview} onNav={setPage}/>}
       {page === "compare" && <CompareTool apiKey={apiKey} model={model} rubric={rubric} onSaveReview={handleSaveReview} onNav={setPage}/>}
-      {page === "rubric" && <RubricBuilder rubric={rubric} setRubric={setRubric}/>}
+      {page === "rubric" && <RubricBuilder rubric={rubric} setRubric={setRubric} apiKey={apiKey} model={model} onNav={setPage}/>}
       {page === "feedback" && <FeedbackComposer apiKey={apiKey} model={model} savedReviews={savedReviews} onNav={setPage}/>}
       {page === "settings" && <Settings apiKey={apiKey} setApiKey={setApiKey} orgName={orgName} setOrgName={setOrgName} model={model} setModel={setModel}/>}
       {page === "about" && <About/>}
