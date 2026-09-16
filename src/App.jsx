@@ -1542,7 +1542,7 @@ function Settings({ apiKey, setApiKey, orgName, setOrgName }) {
 
   return (
     <div style={{ maxWidth: 800, margin: "0 auto", padding: "40px 32px 80px" }}>
-      <PageHeader eyebrow="Settings" title="Sign in" desc="Marksmith runs on the Claude API through your organization's account. Sign in with the access code and password your administrator gave you."/>
+      <PageHeader eyebrow="Settings" title="Sign in" desc="Sign in with the access code and password your administrator gave you."/>
 
       <div style={{ marginTop: 40 }}>
         <SubHeading>Organization access</SubHeading>
