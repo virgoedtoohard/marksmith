@@ -15,6 +15,17 @@ const paperDeep = "#F1EDE1";
 
 const fontsCSS = `@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap');`;
 
+// ============ ROUTING ============
+// Every page has a real URL (#home, #review, #compare, …) so nav links are
+// genuine <a href> tags: normal click navigates in place, and ctrl/cmd-click,
+// middle-click, or "open in new tab" all work the way a browser expects.
+const PAGE_IDS = ["home", "review", "compare", "rubric", "feedback", "records", "about", "settings"];
+function pageFromHash() {
+  if (typeof window === "undefined") return "home";
+  const h = window.location.hash.replace(/^#\/?/, "");
+  return PAGE_IDS.includes(h) ? h : "home";
+}
+
 // ============ BACKEND (Cloudflare Worker) ============
 // Fill this in after you deploy the worker/ folder — see worker/README or
 // the deployment instructions you were given. Example:
@@ -403,19 +414,19 @@ function Nav({ current, onNav, hasKey }) {
   return (
     <header style={{ borderBottom: `1px solid ${rule}`, background: paper, position: "sticky", top: 0, zIndex: 10 }}>
       <div style={{ maxWidth: 1200, margin: "0 auto", padding: "16px 32px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 24, flexWrap: "wrap" }}>
-        <button onClick={() => onNav("home")} style={{ display: "flex", alignItems: "center", gap: 10, background: "transparent", border: "none", cursor: "pointer", padding: 0 }}>
+        <a href="#home" style={{ display: "flex", alignItems: "center", gap: 10, background: "transparent", textDecoration: "none", cursor: "pointer", padding: 0 }}>
           <Logo size={32}/>
           <span style={{ fontFamily: "'Fraunces', serif", fontSize: 22, fontWeight: 500, color: ink, letterSpacing: "-0.01em" }}>Marksmith</span>
-        </button>
+        </a>
         <nav style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
           {items.map((it) => {
             const active = current === it.id;
             const isSettings = it.id === "settings";
             return (
-              <button key={it.id} onClick={() => onNav(it.id)} style={{
+              <a key={it.id} href={`#${it.id}`} style={{
                 background: active ? paperDeep : "transparent",
                 color: active ? ink : inkSoft,
-                border: "none", padding: "8px 14px", cursor: "pointer",
+                textDecoration: "none", padding: "8px 14px", cursor: "pointer",
                 fontFamily: "'Inter', sans-serif", fontSize: 13,
                 fontWeight: active ? 600 : 400, borderRadius: 2,
                 borderBottom: active ? `1.5px solid ${bronze}` : "1.5px solid transparent",
@@ -423,7 +434,7 @@ function Nav({ current, onNav, hasKey }) {
               }}>
                 {it.label}
                 {isSettings && !hasKey && <span title="Not signed in" style={{ width: 6, height: 6, borderRadius: "50%", background: warn, display: "inline-block" }}/>}
-              </button>
+              </a>
             );
           })}
         </nav>
@@ -1626,11 +1637,27 @@ function Footer() {
 
 // ============ APP ============
 export default function App() {
-  const [page, setPage] = useState("home");
+  const [page, setPage] = useState(pageFromHash());
   const [rubric, setRubricState] = useState(loadRubric());
   const [savedReviews, setSavedReviews] = useState(loadRecords());
   const [apiKey, setApiKeyState] = useState(loadApiKey());
   const [orgName, setOrgNameState] = useState(loadOrgName());
+
+  // Keep the page in sync with the URL hash — this is what makes nav links
+  // real pages: back/forward, refresh, and opening a link in a new tab all
+  // land on the right screen instead of always resetting to Home.
+  useEffect(() => {
+    function onHashChange() { setPage(pageFromHash()); }
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+  function goTo(id) {
+    if (typeof window !== "undefined" && window.location.hash.replace(/^#\/?/, "") !== id) {
+      window.location.hash = id;
+    } else {
+      setPage(id);
+    }
+  }
 
   function setApiKey(v) { setApiKeyState(v); saveApiKey(v); }
   function setOrgName(v) { setOrgNameState(v); saveOrgName(v); }
@@ -1661,12 +1688,12 @@ export default function App() {
   return (
     <div style={{ background: paper, minHeight: "100vh", color: ink, fontFamily: "'Inter', system-ui, sans-serif" }}>
       <style>{fontsCSS}</style>
-      <Nav current={page} onNav={setPage} hasKey={hasKey}/>
-      {page === "home" && <Home onNav={setPage} reviewCount={savedReviews.length} rubric={rubric} hasKey={hasKey}/>}
-      {page === "review" && <ReviewTool apiKey={apiKey} rubric={rubric} onSaveReview={handleSaveReview} onNav={setPage}/>}
-      {page === "compare" && <CompareTool apiKey={apiKey} rubric={rubric} onSaveReview={handleSaveReview} onNav={setPage}/>}
-      {page === "rubric" && <RubricBuilder rubric={rubric} setRubric={setRubric} apiKey={apiKey} onNav={setPage}/>}
-      {page === "feedback" && <FeedbackComposer apiKey={apiKey} savedReviews={savedReviews} onNav={setPage}/>}
+      <Nav current={page} onNav={goTo} hasKey={hasKey}/>
+      {page === "home" && <Home onNav={goTo} reviewCount={savedReviews.length} rubric={rubric} hasKey={hasKey}/>}
+      {page === "review" && <ReviewTool apiKey={apiKey} rubric={rubric} onSaveReview={handleSaveReview} onNav={goTo}/>}
+      {page === "compare" && <CompareTool apiKey={apiKey} rubric={rubric} onSaveReview={handleSaveReview} onNav={goTo}/>}
+      {page === "rubric" && <RubricBuilder rubric={rubric} setRubric={setRubric} apiKey={apiKey} onNav={goTo}/>}
+      {page === "feedback" && <FeedbackComposer apiKey={apiKey} savedReviews={savedReviews} onNav={goTo}/>}
       {page === "records" && <RecordsPage records={savedReviews} onUpdateStatus={updateRecordStatus} onUpdateNote={updateRecordNote} onDelete={deleteRecord}/>}
       {page === "settings" && <Settings apiKey={apiKey} setApiKey={setApiKey} orgName={orgName} setOrgName={setOrgName}/>}
       {page === "about" && <About/>}
