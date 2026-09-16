@@ -75,6 +75,17 @@ function loadRecords() {
     return Array.isArray(parsed) ? parsed : [];
   } catch { return []; }
 }
+// Drops the original file (keeping every score, status, letter, and the
+// pasted-text copy when there is one) from all but the most recent records —
+// used when a records payload is too big for local storage or for the sync
+// request to the Worker.
+function stripOldFileBlocks(records, keepRecent = 20) {
+  return records.map((r, i) =>
+    i < records.length - keepRecent && r.application?.fileBlock
+      ? { ...r, application: { ...r.application, fileBlock: null, note: "Original file no longer stored (space limit)." } }
+      : r
+  );
+}
 function saveRecords(records) {
   try {
     localStorage.setItem(RECORDS_KEY, JSON.stringify(records));
@@ -82,19 +93,64 @@ function saveRecords(records) {
     // Likely storage quota exceeded (uploaded PDFs/photos add up fast as base64).
     // Retry once with older file attachments dropped, keeping scores/text intact.
     try {
-      const trimmed = records.map((r, i) =>
-        i < records.length - 20 && r.application?.fileBlock
-          ? { ...r, application: { ...r.application, fileBlock: null, note: "Original file no longer stored (space limit)." } }
-          : r
-      );
-      localStorage.setItem(RECORDS_KEY, JSON.stringify(trimmed));
+      localStorage.setItem(RECORDS_KEY, JSON.stringify(stripOldFileBlocks(records)));
     } catch { /* give up silently — the review itself was already shown to the user */ }
   }
 }
 function newRecordId() {
   return (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
+
+// ============ RECORDS SYNC (per organization, via the Worker) ============
+// Records used to live only in whichever browser created them. Now every
+// mutation is pushed to the Worker under the signed-in organization's own
+// key, and signing in anywhere pulls that organization's records down and
+// merges them with whatever's already local — so "the same account" means
+// the same records, on any browser.
+const MAX_RECORDS_SYNC_BYTES = 20 * 1024 * 1024;
+async function fetchRemoteRecords(apiKey) {
+  const res = await fetch(`${WORKER_URL}/api/records`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  if (!res.ok) throw new Error(`Could not load records from the server (${res.status})`);
+  const data = await res.json().catch(() => ({}));
+  return Array.isArray(data.records) ? data.records : [];
+}
+async function pushRemoteRecords(apiKey, records) {
+  let payload = records;
+  try {
+    if (new TextEncoder().encode(JSON.stringify(payload)).length > MAX_RECORDS_SYNC_BYTES) {
+      payload = stripOldFileBlocks(records);
+    }
+  } catch { /* fall through with the original payload */ }
+  try {
+    await fetch(`${WORKER_URL}/api/records`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ records: payload }),
+    });
+  } catch {
+    // Offline or the Worker is unreachable — this browser's own copy (in
+    // localStorage) is already saved regardless; the next successful sync
+    // will catch the server back up.
+  }
+}
+// Combines this browser's records with the organization's server copy,
+// keeping whichever version of each record was edited most recently.
+function mergeRecords(local, remote) {
+  const byId = new Map();
+  for (const r of local) byId.set(r.id, r);
+  for (const r of remote) {
+    const existing = byId.get(r.id);
+    if (!existing) { byId.set(r.id, r); continue; }
+    const existingTime = new Date(existing.updatedAt || existing.timestamp || 0).getTime();
+    const incomingTime = new Date(r.updatedAt || r.timestamp || 0).getTime();
+    if (incomingTime >= existingTime) byId.set(r.id, r);
+  }
+  return Array.from(byId.values());
+}
 function makeRecord({ parsed, label, application, rubricSnapshot, source }) {
+  const now = new Date().toISOString();
   return {
     id: newRecordId(),
     ...parsed,
@@ -104,7 +160,8 @@ function makeRecord({ parsed, label, application, rubricSnapshot, source }) {
     source,
     status: "pending",
     reviewerNote: "",
-    timestamp: new Date().toISOString(),
+    timestamp: now,
+    updatedAt: now,
     history: [],
     letters: [],
   };
@@ -1624,6 +1681,7 @@ function Settings({ apiKey, setApiKey, orgName, setOrgName }) {
         {apiKey ? (
           <div style={{ border: `1px solid ${rule}`, background: "#fff", padding: 20, borderRadius: 2 }}>
             <div style={{ fontSize: 14, color: inkSoft }}>Signed in as <strong style={{ color: ink }}>{orgName || "your organization"}</strong>.</div>
+            <div style={{ marginTop: 6, fontSize: 12, color: muted }}>Records sync to any browser signed in with this same access code, and clear from this one when you sign out.</div>
             {usage && <div style={{ marginTop: 8, fontSize: 12, color: muted, fontFamily: "'JetBrains Mono', monospace" }}>Usage this month: {usage.used}{usage.limit ? ` / ${usage.limit}` : ""}</div>}
             <div style={{ marginTop: 16 }}>
               <button onClick={signOut} style={{ ...ghostBtn, color: warn }}>Sign out</button>
@@ -1734,8 +1792,43 @@ export default function App() {
     }
   }
 
-  function setApiKey(v) { setApiKeyState(v); saveApiKey(v); }
+  function setApiKey(v) {
+    if (!v && apiKey) {
+      // Signing out — flush this browser's latest edits to the organization's
+      // server copy one last time, then wipe the local copy so applicant
+      // data doesn't linger in this browser once no one's signed in.
+      pushRemoteRecords(apiKey, savedReviews);
+      setSavedReviews([]);
+      saveRecords([]);
+    }
+    setApiKeyState(v); saveApiKey(v);
+  }
   function setOrgName(v) { setOrgNameState(v); saveOrgName(v); }
+
+  // Whenever we're signed in (fresh sign-in, or already signed in on reload),
+  // pull this organization's records from the server and merge them with
+  // whatever's local, so a different browser signed into the same account
+  // sees the same records instead of an empty list.
+  useEffect(() => {
+    if (!apiKey) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const remote = await fetchRemoteRecords(apiKey);
+        if (cancelled) return;
+        setSavedReviews((local) => {
+          const merged = mergeRecords(local, remote);
+          saveRecords(merged);
+          pushRemoteRecords(apiKey, merged);
+          return merged;
+        });
+      } catch {
+        // Offline or the Worker is unreachable — keep what's local; this
+        // retries every time apiKey changes (e.g. the next sign-in).
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [apiKey]);
   function setRubric(updater) {
     setRubricState((prev) => {
       const next = typeof updater === "function" ? updater(prev) : updater;
@@ -1743,24 +1836,47 @@ export default function App() {
       return next;
     });
   }
-  function handleSaveReview(r) { setSavedReviews((all) => { const next = [r, ...all]; saveRecords(next); return next; }); }
+  function handleSaveReview(r) {
+    setSavedReviews((all) => {
+      const next = [r, ...all];
+      saveRecords(next);
+      if (apiKey) pushRemoteRecords(apiKey, next);
+      return next;
+    });
+  }
   function updateRecordStatus(id, status) {
     setSavedReviews((all) => {
       const next = all.map((r) => {
         if (r.id !== id) return r;
         const entry = { status, changedAt: new Date().toISOString(), changedBy: orgName || "Unknown organization" };
-        return { ...r, status, history: [...(r.history || []), entry] };
+        return { ...r, status, history: [...(r.history || []), entry], updatedAt: new Date().toISOString() };
       });
       saveRecords(next);
+      if (apiKey) pushRemoteRecords(apiKey, next);
       return next;
     });
   }
-  function updateRecordNote(id, note) { setSavedReviews((all) => { const next = all.map((r) => (r.id === id ? { ...r, reviewerNote: note } : r)); saveRecords(next); return next; }); }
-  function deleteRecord(id) { setSavedReviews((all) => { const next = all.filter((r) => r.id !== id); saveRecords(next); return next; }); }
+  function updateRecordNote(id, note) {
+    setSavedReviews((all) => {
+      const next = all.map((r) => (r.id === id ? { ...r, reviewerNote: note, updatedAt: new Date().toISOString() } : r));
+      saveRecords(next);
+      if (apiKey) pushRemoteRecords(apiKey, next);
+      return next;
+    });
+  }
+  function deleteRecord(id) {
+    setSavedReviews((all) => {
+      const next = all.filter((r) => r.id !== id);
+      saveRecords(next);
+      if (apiKey) pushRemoteRecords(apiKey, next);
+      return next;
+    });
+  }
   function addLetterToRecord(id, letter) {
     setSavedReviews((all) => {
-      const next = all.map((r) => (r.id === id ? { ...r, letters: [...(r.letters || []), letter] } : r));
+      const next = all.map((r) => (r.id === id ? { ...r, letters: [...(r.letters || []), letter], updatedAt: new Date().toISOString() } : r));
       saveRecords(next);
+      if (apiKey) pushRemoteRecords(apiKey, next);
       return next;
     });
   }
