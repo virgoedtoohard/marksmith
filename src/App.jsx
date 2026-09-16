@@ -50,6 +50,69 @@ function loadModel() {
 function saveModel(v) {
   try { localStorage.setItem(MODEL_KEY, v); } catch {}
 }
+const RUBRIC_KEY = "marksmith:rubric";
+function loadRubric() {
+  try {
+    const raw = localStorage.getItem(RUBRIC_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return Array.isArray(parsed) && parsed.length > 0 ? parsed : DEFAULT_RUBRIC;
+  } catch { return DEFAULT_RUBRIC; }
+}
+function saveRubric(v) {
+  try { localStorage.setItem(RUBRIC_KEY, JSON.stringify(v)); } catch {}
+}
+
+// ============ RECORDS STORAGE ============
+// Every scored application (from Review or Compare) is kept here — score,
+// status, and the original application — so it survives closing the tab.
+const RECORDS_KEY = "marksmith:records";
+function loadRecords() {
+  try {
+    const raw = localStorage.getItem(RECORDS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch { return []; }
+}
+function saveRecords(records) {
+  try {
+    localStorage.setItem(RECORDS_KEY, JSON.stringify(records));
+  } catch {
+    // Likely storage quota exceeded (uploaded PDFs/photos add up fast as base64).
+    // Retry once with older file attachments dropped, keeping scores/text intact.
+    try {
+      const trimmed = records.map((r, i) =>
+        i < records.length - 20 && r.application?.fileBlock
+          ? { ...r, application: { ...r.application, fileBlock: null, note: "Original file no longer stored (space limit)." } }
+          : r
+      );
+      localStorage.setItem(RECORDS_KEY, JSON.stringify(trimmed));
+    } catch { /* give up silently — the review itself was already shown to the user */ }
+  }
+}
+function newRecordId() {
+  return (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+function makeRecord({ parsed, label, application, rubricSnapshot, source }) {
+  return {
+    id: newRecordId(),
+    ...parsed,
+    label,
+    application,
+    rubricSnapshot,
+    source,
+    status: "pending",
+    reviewerNote: "",
+    timestamp: new Date().toISOString(),
+  };
+}
+const STATUS_OPTIONS = [
+  { id: "pending", label: "Pending", color: muted },
+  { id: "shortlisted", label: "Shortlisted", color: bronze },
+  { id: "awarded", label: "Awarded", color: good },
+  { id: "waitlisted", label: "Waitlisted", color: warn },
+  { id: "declined", label: "Declined", color: bad },
+];
+function statusMeta(id) { return STATUS_OPTIONS.find((s) => s.id === id) || STATUS_OPTIONS[0]; }
 
 // ============ HELPERS ============
 function fileToBase64(file) {
@@ -257,6 +320,7 @@ function Nav({ current, onNav, hasKey }) {
     { id: "compare", label: "Compare" },
     { id: "rubric", label: "Rubric" },
     { id: "feedback", label: "Feedback" },
+    { id: "records", label: "Records" },
     { id: "about", label: "About" },
     { id: "settings", label: "Settings" },
   ];
@@ -331,7 +395,7 @@ function Home({ onNav, reviewCount, rubric, hasKey }) {
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
             <Stat n={rubric.length} label="Criteria"/>
             <Stat n={totalPts} label="Points possible"/>
-            <Stat n={reviewCount} label="Reviews this session"/>
+            <Stat n={reviewCount} label="Reviews recorded"/>
             <Stat n={"4"} label="Tools on the desk"/>
           </div>
         </div>
@@ -430,9 +494,15 @@ Respond with ONLY valid JSON (no markdown, no preamble):
     try {
       const text = await callClaude(apiKey, model, system, userContent, 2000);
       const parsed = JSON.parse(cleanJSON(text));
-      const withLabel = { ...parsed, label: applicantLabel || parsed.applicant?.name || "Untitled review", timestamp: new Date().toISOString() };
-      setResult(withLabel);
-      onSaveReview(withLabel);
+      const record = makeRecord({
+        parsed,
+        label: applicantLabel || parsed.applicant?.name || "Untitled review",
+        application: { text: applicationText, fileBlock, fileName },
+        rubricSnapshot: rubric,
+        source: "review",
+      });
+      setResult(record);
+      onSaveReview(record);
     } catch (err) { setError(err.message || "Something went wrong. Try again."); }
     finally { setAnalyzing(false); }
   }
@@ -702,9 +772,15 @@ Respond with ONLY valid JSON:
           : `Please review this scholarship application:\n\n${a.text}`;
         const text = await callClaude(apiKey, model, system, userContent, 2000);
         const parsed = JSON.parse(cleanJSON(text));
-        const withLabel = { ...parsed, label: a.label || parsed.applicant?.name || `Applicant ${i + 1}`, timestamp: new Date().toISOString() };
-        out.push(withLabel);
-        onSaveReview(withLabel);
+        const record = makeRecord({
+          parsed,
+          label: a.label || parsed.applicant?.name || `Applicant ${i + 1}`,
+          application: { text: a.text, fileBlock: a.fileBlock, fileName: a.fileName },
+          rubricSnapshot: activeRubric,
+          source: "compare",
+        });
+        out.push(record);
+        onSaveReview(record);
       } catch (err) {
         out.push({ label: a.label || `Applicant ${i + 1}`, error: err.message, totalPoints: 0, totalMax });
       }
@@ -985,8 +1061,111 @@ function RubricBuilder({ rubric, setRubric, apiKey, model, onNav }) {
           </div>
         </div>
         <p style={{ fontSize: 12, color: muted, marginTop: 12, fontStyle: "italic" }}>
-          Changes save in this session. Your rubric is used automatically by Review and Compare.
+          Changes are saved in this browser. Your rubric is used automatically by Review and Compare.
         </p>
+      </div>
+    </div>
+  );
+}
+
+// ============ RECORDS ============
+function ApplicationPreview({ application }) {
+  if (!application) return <div style={{ fontSize: 13, color: muted }}>Not stored.</div>;
+  const { text, fileBlock, fileName, note } = application;
+  if (fileBlock?.type === "image") {
+    return <img src={`data:${fileBlock.source.media_type};base64,${fileBlock.source.data}`} alt={fileName || "application photo"} style={{ maxWidth: "100%", border: `1px solid ${rule}`, borderRadius: 2, display: "block" }}/>;
+  }
+  if (fileBlock?.type === "document") {
+    return (
+      <div>
+        <div style={{ fontSize: 13, color: inkSoft, marginBottom: 8 }}>{fileName}</div>
+        <iframe title={fileName || "application PDF"} src={`data:application/pdf;base64,${fileBlock.source.data}`} style={{ width: "100%", height: 500, border: `1px solid ${rule}` }}/>
+      </div>
+    );
+  }
+  if (text) {
+    return <div style={{ whiteSpace: "pre-wrap", fontSize: 14, lineHeight: 1.6, color: inkSoft, maxHeight: 420, overflow: "auto", border: `1px solid ${rule}`, padding: 16, borderRadius: 2, background: paper }}>{text}</div>;
+  }
+  if (note) return <div style={{ fontSize: 13, color: muted, fontStyle: "italic" }}>{note}</div>;
+  return <div style={{ fontSize: 13, color: muted }}>No original text or file was stored for this record.</div>;
+}
+
+function RecordCard({ record, open, onToggle, onUpdateStatus, onUpdateNote, onDelete }) {
+  const pct = record.totalMax > 0 ? Math.round(((record.totalPoints || 0) / record.totalMax) * 100) : 0;
+  const meta = statusMeta(record.status || "pending");
+  return (
+    <div style={{ border: `1px solid ${rule}`, background: "#fff", borderRadius: 2, marginBottom: 12 }}>
+      <div style={{ padding: "16px 20px", display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap", cursor: "pointer" }} onClick={onToggle}>
+        <div style={{ flex: 1, minWidth: 180 }}>
+          <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, color: ink }}>{record.label}</div>
+          <div style={{ fontSize: 12, color: muted, marginTop: 2 }}>
+            {new Date(record.timestamp).toLocaleString()} · via {record.source === "compare" ? "Compare" : "Review"}
+          </div>
+        </div>
+        <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 14, color: ink, whiteSpace: "nowrap" }}>
+          {record.totalPoints ?? 0}/{record.totalMax ?? 0} <span style={{ color: muted }}>({pct}%)</span>
+        </div>
+        <select value={record.status || "pending"} onClick={(e) => e.stopPropagation()}
+          onChange={(e) => onUpdateStatus(record.id, e.target.value)}
+          style={{ ...editInput, width: 150, color: meta.color, fontWeight: 600 }}>
+          {STATUS_OPTIONS.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
+        </select>
+        <button onClick={(e) => { e.stopPropagation(); if (window.confirm("Delete this record? This can't be undone.")) onDelete(record.id); }}
+          style={{ ...ghostBtn, color: warn }}>Delete</button>
+      </div>
+      {open && (
+        <div style={{ borderTop: `1px solid ${rule}`, padding: 20 }}>
+          <SubHeading>Original application</SubHeading>
+          <ApplicationPreview application={record.application}/>
+          <div style={{ marginTop: 24 }}>
+            <ReviewOutput result={record}/>
+          </div>
+          <div style={{ marginTop: 24 }}>
+            <SubHeading>Reviewer note</SubHeading>
+            <textarea key={record.id} defaultValue={record.reviewerNote || ""} onBlur={(e) => onUpdateNote(record.id, e.target.value)}
+              placeholder="Private notes for your committee — not shared with the applicant…"
+              style={{ ...editInput, minHeight: 80, width: "100%", boxSizing: "border-box", resize: "vertical" }}/>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RecordsPage({ records, onUpdateStatus, onUpdateNote, onDelete }) {
+  const [openId, setOpenId] = useState(null);
+  const [filter, setFilter] = useState("all");
+  const filtered = filter === "all" ? records : records.filter((r) => (r.status || "pending") === filter);
+  const sorted = [...filtered].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+  return (
+    <div style={{ maxWidth: 1100, margin: "0 auto", padding: "40px 32px 80px" }}>
+      <PageHeader eyebrow="Records" title="Application records" desc="Every application you've reviewed, with its score and decision status — kept in this browser."/>
+
+      <div style={{ marginTop: 32, display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <button onClick={() => setFilter("all")} style={{ ...ghostBtn, background: filter === "all" ? paperDeep : "transparent", fontWeight: filter === "all" ? 600 : 400 }}>All ({records.length})</button>
+        {STATUS_OPTIONS.map((s) => {
+          const count = records.filter((r) => (r.status || "pending") === s.id).length;
+          return (
+            <button key={s.id} onClick={() => setFilter(s.id)} style={{ ...ghostBtn, background: filter === s.id ? paperDeep : "transparent", fontWeight: filter === s.id ? 600 : 400, color: s.color }}>
+              {s.label} ({count})
+            </button>
+          );
+        })}
+      </div>
+
+      <div style={{ marginTop: 24 }}>
+        {sorted.length === 0 && (
+          <div style={{ border: `1px dashed ${rule}`, padding: "60px 24px", textAlign: "center", color: muted, borderRadius: 2 }}>
+            {records.length === 0
+              ? "No records yet. Run a review from the Review or Compare tool — every scored application lands here automatically."
+              : "No records match this filter."}
+          </div>
+        )}
+        {sorted.map((r) => (
+          <RecordCard key={r.id} record={r} open={openId === r.id} onToggle={() => setOpenId(openId === r.id ? null : r.id)}
+            onUpdateStatus={onUpdateStatus} onUpdateNote={onUpdateNote} onDelete={onDelete}/>
+        ))}
       </div>
     </div>
   );
@@ -1065,23 +1244,29 @@ ${(selected.keyFacts || []).map((f) => `- ${f}`).join("\n")}`;
           <SubHeading>Reviewed application</SubHeading>
           {savedReviews.length === 0 ? (
             <div style={{ border: `1px dashed ${rule}`, padding: 20, borderRadius: 2, color: muted, fontSize: 14, marginBottom: 20 }}>
-              No reviews yet this session. Head to <strong style={{ color: ink }}>Review</strong> or <strong style={{ color: ink }}>Compare</strong> first — the results will show up here.
+              No reviews yet. Head to <strong style={{ color: ink }}>Review</strong> or <strong style={{ color: ink }}>Compare</strong> first — the results will show up here.
             </div>
           ) : (
             <div style={{ border: `1px solid ${rule}`, background: "#fff", borderRadius: 2, marginBottom: 20, maxHeight: 200, overflowY: "auto" }}>
-              {savedReviews.map((r, i) => (
-                <button key={i} onClick={() => setSelectedIdx(i)} style={{
-                  display: "block", width: "100%", textAlign: "left",
-                  padding: "12px 16px", background: selectedIdx === i ? paperDeep : "transparent",
-                  border: "none", borderTop: i === 0 ? "none" : `1px solid ${rule}`,
-                  cursor: "pointer", fontFamily: "'Inter', sans-serif",
-                }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 }}>
-                    <span style={{ fontFamily: "'Fraunces', serif", fontSize: 15, color: ink }}>{r.label}</span>
-                    <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: bronze }}>{r.totalPoints}/{r.totalMax}</span>
-                  </div>
-                </button>
-              ))}
+              {savedReviews.map((r, i) => {
+                const meta = statusMeta(r.status || "pending");
+                return (
+                  <button key={r.id || i} onClick={() => setSelectedIdx(i)} style={{
+                    display: "block", width: "100%", textAlign: "left",
+                    padding: "12px 16px", background: selectedIdx === i ? paperDeep : "transparent",
+                    border: "none", borderTop: i === 0 ? "none" : `1px solid ${rule}`,
+                    cursor: "pointer", fontFamily: "'Inter', sans-serif",
+                  }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 }}>
+                      <span style={{ fontFamily: "'Fraunces', serif", fontSize: 15, color: ink }}>{r.label}</span>
+                      <span style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+                        <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10, color: meta.color, textTransform: "uppercase", letterSpacing: "0.06em" }}>{meta.label}</span>
+                        <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: bronze }}>{r.totalPoints}/{r.totalMax}</span>
+                      </span>
+                    </div>
+                  </button>
+                );
+              })}
             </div>
           )}
 
@@ -1217,9 +1402,6 @@ function Settings({ apiKey, setApiKey, orgName, setOrgName, model, setModel }) {
           </div>
         )}
 
-        <div style={{ marginTop: 16, padding: 16, background: paperDeep, borderLeft: `3px solid ${bronze}`, borderRadius: 2, fontSize: 13, color: inkSoft, lineHeight: 1.6 }}>
-          <strong style={{ color: ink }}>Don't have an access code?</strong> Contact the person who set up Marksmith for your organization — they issue codes and can set usage limits per organization.
-        </div>
       </div>
 
       <div style={{ marginTop: 48 }}>
@@ -1255,7 +1437,7 @@ function About() {
         <AboutStep n="IV" title="Draft the reply" body="When you're ready to write to the applicant, Feedback pulls the review you did and drafts a letter — award, waitlist, or decline — in the tone you pick. Scores stay off the letter."/>
       </div>
       <div style={{ marginTop: 48, padding: 24, background: paperDeep, borderLeft: `3px solid ${bronze}`, borderRadius: 2, fontSize: 14, color: inkSoft, lineHeight: 1.7 }}>
-        <strong style={{ color: ink }}>Note.</strong> Marksmith is a first-pass reader. It doesn't replace a human review; it gets the boring parts out of the way. Reviews live in the current window only. Your sign-in session is stored locally in this browser.
+        <strong style={{ color: ink }}>Note.</strong> Marksmith is a first-pass reader. It doesn't replace a human review; it gets the boring parts out of the way. Every review is saved to Records in this browser, along with the original application — so you can track decisions over time. Your sign-in session is also stored locally in this browser.
       </div>
     </div>
   );
@@ -1303,8 +1485,8 @@ function Footer() {
 // ============ APP ============
 export default function App() {
   const [page, setPage] = useState("home");
-  const [rubric, setRubric] = useState(DEFAULT_RUBRIC);
-  const [savedReviews, setSavedReviews] = useState([]);
+  const [rubric, setRubricState] = useState(loadRubric());
+  const [savedReviews, setSavedReviews] = useState(loadRecords());
   const [apiKey, setApiKeyState] = useState(loadApiKey());
   const [orgName, setOrgNameState] = useState(loadOrgName());
   const [model, setModelState] = useState(loadModel());
@@ -1312,7 +1494,17 @@ export default function App() {
   function setApiKey(v) { setApiKeyState(v); saveApiKey(v); }
   function setOrgName(v) { setOrgNameState(v); saveOrgName(v); }
   function setModel(v) { setModelState(v); saveModel(v); }
-  function handleSaveReview(r) { setSavedReviews((all) => [...all, r]); }
+  function setRubric(updater) {
+    setRubricState((prev) => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      saveRubric(next);
+      return next;
+    });
+  }
+  function handleSaveReview(r) { setSavedReviews((all) => { const next = [r, ...all]; saveRecords(next); return next; }); }
+  function updateRecordStatus(id, status) { setSavedReviews((all) => { const next = all.map((r) => (r.id === id ? { ...r, status } : r)); saveRecords(next); return next; }); }
+  function updateRecordNote(id, note) { setSavedReviews((all) => { const next = all.map((r) => (r.id === id ? { ...r, reviewerNote: note } : r)); saveRecords(next); return next; }); }
+  function deleteRecord(id) { setSavedReviews((all) => { const next = all.filter((r) => r.id !== id); saveRecords(next); return next; }); }
 
   const hasKey = !!apiKey;
 
@@ -1325,6 +1517,7 @@ export default function App() {
       {page === "compare" && <CompareTool apiKey={apiKey} model={model} rubric={rubric} onSaveReview={handleSaveReview} onNav={setPage}/>}
       {page === "rubric" && <RubricBuilder rubric={rubric} setRubric={setRubric} apiKey={apiKey} model={model} onNav={setPage}/>}
       {page === "feedback" && <FeedbackComposer apiKey={apiKey} model={model} savedReviews={savedReviews} onNav={setPage}/>}
+      {page === "records" && <RecordsPage records={savedReviews} onUpdateStatus={updateRecordStatus} onUpdateNote={updateRecordNote} onDelete={deleteRecord}/>}
       {page === "settings" && <Settings apiKey={apiKey} setApiKey={setApiKey} orgName={orgName} setOrgName={setOrgName} model={model} setModel={setModel}/>}
       {page === "about" && <About/>}
       <Footer/>
