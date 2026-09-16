@@ -106,6 +106,7 @@ function makeRecord({ parsed, label, application, rubricSnapshot, source }) {
     reviewerNote: "",
     timestamp: new Date().toISOString(),
     history: [],
+    letters: [],
   };
 }
 const STATUS_OPTIONS = [
@@ -116,6 +117,8 @@ const STATUS_OPTIONS = [
   { id: "declined", label: "Declined", color: bad },
 ];
 function statusMeta(id) { return STATUS_OPTIONS.find((s) => s.id === id) || STATUS_OPTIONS[0]; }
+const DECISION_LABELS = { awarded: "Awarded", waitlist: "Waitlist", declined: "Not selected" };
+const TONE_LABELS = { warm: "Warm", neutral: "Neutral", formal: "Formal" };
 
 // ============ RECORDS EXPORT (CSV + bulk application download) ============
 function csvEscape(value) {
@@ -1262,6 +1265,29 @@ function RecordCard({ record, open, onToggle, onUpdateStatus, onUpdateNote, onDe
             )}
           </div>
           <div style={{ marginTop: 24 }}>
+            <SubHeading>Letters sent</SubHeading>
+            {record.letters && record.letters.length > 0 ? (
+              <div style={{ display: "grid", gap: 12 }}>
+                {record.letters.slice().reverse().map((l, i) => (
+                  <div key={l.id || i} style={{ border: `1px solid ${rule}`, borderRadius: 2, padding: 16, background: paperDeep }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8, fontSize: 11, color: muted, fontFamily: "'JetBrains Mono', monospace", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 10 }}>
+                      <span>{DECISION_LABELS[l.decision] || l.decision} · {TONE_LABELS[l.tone] || l.tone}</span>
+                      <span>{new Date(l.generatedAt).toLocaleString()}{l.generatedBy ? ` · by ${l.generatedBy}` : ""}</span>
+                    </div>
+                    {(l.scholarshipName || l.signerName) && (
+                      <div style={{ fontSize: 12, color: inkSoft, marginBottom: 10 }}>
+                        {l.scholarshipName}{l.scholarshipName && l.signerName ? " — " : ""}{l.signerName ? `Signed by ${l.signerName}` : ""}
+                      </div>
+                    )}
+                    <div style={{ whiteSpace: "pre-wrap", fontSize: 14, lineHeight: 1.6, color: ink, fontFamily: "'Fraunces', serif" }}>{l.text}</div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div style={{ fontSize: 13, color: muted }}>No letters drafted for this application yet — use Feedback to write one.</div>
+            )}
+          </div>
+          <div style={{ marginTop: 24 }}>
             <SubHeading>Reviewer note</SubHeading>
             <textarea key={record.id} defaultValue={record.reviewerNote || ""} onBlur={(e) => onUpdateNote(record.id, e.target.value)}
               placeholder="Private notes for your committee — not shared with the applicant…"
@@ -1273,7 +1299,7 @@ function RecordCard({ record, open, onToggle, onUpdateStatus, onUpdateNote, onDe
   );
 }
 
-function RecordsPage({ records, onUpdateStatus, onUpdateNote, onDelete }) {
+function RecordsPage({ records, onUpdateStatus, onUpdateNote, onDelete, hasKey, onNav }) {
   const [openId, setOpenId] = useState(null);
   const [filter, setFilter] = useState("all");
   const [zipping, setZipping] = useState(false);
@@ -1290,6 +1316,24 @@ function RecordsPage({ records, onUpdateStatus, onUpdateNote, onDelete }) {
     } finally {
       setZipping(false);
     }
+  }
+
+  // Applicant essays, scores, and decisions are sensitive — never render them
+  // once signed out, even though the browser still holds them locally.
+  if (!hasKey) {
+    return (
+      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "40px 32px 80px" }}>
+        <PageHeader eyebrow="Records" title="Application records" desc="Sign in to view the applications your organization has reviewed."/>
+        <div style={{ marginTop: 32, border: `1px dashed ${rule}`, padding: "60px 24px", textAlign: "center", color: muted, borderRadius: 2 }}>
+          <div style={{ fontFamily: "'Fraunces', serif", fontSize: 22, color: inkSoft, marginBottom: 8 }}>Signed out</div>
+          Records are only visible while signed in.{" "}
+          <button onClick={() => onNav("settings")} style={{ background: "none", border: "none", color: bronze, borderBottom: `1px solid ${bronze}`, cursor: "pointer", padding: 0, fontFamily: "inherit", fontSize: "inherit" }}>
+            Open Settings
+          </button>{" "}
+          to sign back in.
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -1340,7 +1384,7 @@ function RecordsPage({ records, onUpdateStatus, onUpdateNote, onDelete }) {
 }
 
 // ============ TOOL IV: FEEDBACK ============
-function FeedbackComposer({ apiKey, savedReviews, onNav }) {
+function FeedbackComposer({ apiKey, savedReviews, orgName, onSaveLetter, onNav }) {
   const [selectedIdx, setSelectedIdx] = useState(savedReviews.length > 0 ? 0 : -1);
   const [decision, setDecision] = useState("awarded");
   const [tone, setTone] = useState("warm");
@@ -1348,13 +1392,14 @@ function FeedbackComposer({ apiKey, savedReviews, onNav }) {
   const [signerName, setSignerName] = useState("");
   const [generating, setGenerating] = useState(false);
   const [letter, setLetter] = useState("");
+  const [saved, setSaved] = useState(false);
   const [error, setError] = useState(null);
   const selected = selectedIdx >= 0 && selectedIdx < savedReviews.length ? savedReviews[selectedIdx] : null;
 
   async function generate() {
     if (!apiKey) return setError("You're not signed in. Open Settings first.");
     if (!selected) return setError("Select a reviewed application first.");
-    setGenerating(true); setError(null); setLetter("");
+    setGenerating(true); setError(null); setLetter(""); setSaved(false);
 
     const scoresText = selected.scores?.map((s) => `- ${s.criterion}: ${s.points}/${s.maxPoints} — ${s.reasoning}`).join("\n") || "";
     const decisionText = { awarded: "The applicant is being AWARDED the scholarship.", waitlist: "The applicant is being placed on the WAITLIST.", declined: "The applicant is NOT being selected for the scholarship." }[decision];
@@ -1389,7 +1434,20 @@ ${(selected.keyFacts || []).map((f) => `- ${f}`).join("\n")}`;
 
     try {
       const text = await callClaude(apiKey, DEFAULT_MODEL, system, userMsg, 1500);
-      setLetter(text.trim());
+      const cleanText = text.trim();
+      setLetter(cleanText);
+      if (selected?.id && onSaveLetter) {
+        onSaveLetter(selected.id, {
+          id: newRecordId(),
+          text: cleanText,
+          decision, tone,
+          scholarshipName: scholarshipName || "",
+          signerName: signerName || "",
+          generatedAt: new Date().toISOString(),
+          generatedBy: orgName || "Unknown organization",
+        });
+        setSaved(true);
+      }
     } catch (err) { setError(err.message); }
     finally { setGenerating(false); }
   }
@@ -1401,10 +1459,20 @@ ${(selected.keyFacts || []).map((f) => `- ${f}`).join("\n")}`;
   ];
   const tones = [{ id: "warm", label: "Warm" }, { id: "neutral", label: "Neutral" }, { id: "formal", label: "Formal" }];
 
+  // The applicant list below includes names, scores, and statuses — never
+  // show it while signed out.
+  if (!apiKey) {
+    return (
+      <div style={{ maxWidth: 1200, margin: "0 auto", padding: "40px 32px 80px" }}>
+        <PageHeader eyebrow="Tool IV" title="Feedback" desc="Draft the letter that goes to the applicant."/>
+        <div style={{ marginTop: 24 }}><KeyBanner onNav={onNav}/></div>
+      </div>
+    );
+  }
+
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto", padding: "40px 32px 80px" }}>
       <PageHeader eyebrow="Tool IV" title="Feedback" desc="Draft the letter that goes to the applicant."/>
-      {!apiKey && <div style={{ marginTop: 24 }}><KeyBanner onNav={onNav}/></div>}
 
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.2fr)", gap: 40, marginTop: 40 }}>
         <section>
@@ -1494,9 +1562,16 @@ ${(selected.keyFacts || []).map((f) => `- ${f}`).join("\n")}`;
             </div>
           )}
           {letter && (
-            <div style={{ border: `1px solid ${rule}`, background: "#fff", padding: "32px 36px", borderRadius: 2, whiteSpace: "pre-wrap", fontFamily: "'Fraunces', serif", fontSize: 16, lineHeight: 1.7, color: ink }}>
-              {letter}
-            </div>
+            <>
+              <div style={{ border: `1px solid ${rule}`, background: "#fff", padding: "32px 36px", borderRadius: 2, whiteSpace: "pre-wrap", fontFamily: "'Fraunces', serif", fontSize: 16, lineHeight: 1.7, color: ink }}>
+                {letter}
+              </div>
+              {saved && (
+                <div style={{ marginTop: 12, fontSize: 12, color: muted, fontFamily: "'JetBrains Mono', monospace" }}>
+                  Saved to {selected?.label || "this applicant"}'s record — see Records for the full history.
+                </div>
+              )}
+            </>
           )}
         </section>
       </div>
@@ -1682,6 +1757,13 @@ export default function App() {
   }
   function updateRecordNote(id, note) { setSavedReviews((all) => { const next = all.map((r) => (r.id === id ? { ...r, reviewerNote: note } : r)); saveRecords(next); return next; }); }
   function deleteRecord(id) { setSavedReviews((all) => { const next = all.filter((r) => r.id !== id); saveRecords(next); return next; }); }
+  function addLetterToRecord(id, letter) {
+    setSavedReviews((all) => {
+      const next = all.map((r) => (r.id === id ? { ...r, letters: [...(r.letters || []), letter] } : r));
+      saveRecords(next);
+      return next;
+    });
+  }
 
   const hasKey = !!apiKey;
 
@@ -1693,8 +1775,8 @@ export default function App() {
       {page === "review" && <ReviewTool apiKey={apiKey} rubric={rubric} onSaveReview={handleSaveReview} onNav={goTo}/>}
       {page === "compare" && <CompareTool apiKey={apiKey} rubric={rubric} onSaveReview={handleSaveReview} onNav={goTo}/>}
       {page === "rubric" && <RubricBuilder rubric={rubric} setRubric={setRubric} apiKey={apiKey} onNav={goTo}/>}
-      {page === "feedback" && <FeedbackComposer apiKey={apiKey} savedReviews={savedReviews} onNav={goTo}/>}
-      {page === "records" && <RecordsPage records={savedReviews} onUpdateStatus={updateRecordStatus} onUpdateNote={updateRecordNote} onDelete={deleteRecord}/>}
+      {page === "feedback" && <FeedbackComposer apiKey={apiKey} savedReviews={savedReviews} orgName={orgName} onSaveLetter={addLetterToRecord} onNav={goTo}/>}
+      {page === "records" && <RecordsPage records={savedReviews} onUpdateStatus={updateRecordStatus} onUpdateNote={updateRecordNote} onDelete={deleteRecord} hasKey={hasKey} onNav={goTo}/>}
       {page === "settings" && <Settings apiKey={apiKey} setApiKey={setApiKey} orgName={orgName} setOrgName={setOrgName}/>}
       {page === "about" && <About/>}
       <Footer/>
