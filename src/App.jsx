@@ -20,20 +20,21 @@ const fontsCSS = `@import url('https://fonts.googleapis.com/css2?family=Fraunces
 // screen size unless we say otherwise. This one small stylesheet is the
 // "otherwise": it narrows side margins and collapses side-by-side layouts
 // (grids marked .ms-split-2 / .ms-criterion) into a single column on phone
-// widths, and switches the navigation between a pinned desktop sidebar and
-// a phone drawer opened from a fixed top bar.
+// widths, and switches between the desktop top nav and the phone top bar —
+// both of which can open the same slide-out sidebar drawer from their ☰
+// button, closed by default on every screen size until it's clicked open.
 const responsiveCSS = `
-.ms-main { margin-left: 0; padding-top: 56px; }
+.ms-main { padding-top: 56px; }
 .ms-mobile-topbar { display: none; }
+.ms-desktop-nav { display: block; }
 @media (max-width: 720px) {
   .ms-mobile-topbar { display: flex !important; }
+  .ms-desktop-nav { display: none !important; }
   .ms-page, .ms-footer { padding-left: 16px !important; padding-right: 16px !important; }
   .ms-split-2, .ms-criterion { grid-template-columns: 1fr !important; }
 }
 @media (min-width: 721px) {
-  .ms-sidebar { transform: none !important; }
-  .ms-backdrop { display: none !important; }
-  .ms-main { margin-left: ${SIDEBAR_WIDTH}px !important; padding-top: 0 !important; }
+  .ms-main { padding-top: 0 !important; }
 }
 `;
 
@@ -510,10 +511,52 @@ const NAV_ITEMS = [
   { id: "about", label: "About" },
   { id: "settings", label: "Settings" },
 ];
-// A left sidebar on desktop (always visible, pinned) and a slide-out drawer
-// on phone (opened from a fixed top bar) — same set of links either way, so
-// there's one menu to maintain instead of a desktop nav and a separate
-// mobile one.
+// The desktop header — logo, full link row, same as before — plus a ☰
+// button that opens the same slide-out sidebar drawer the phone view uses.
+// The drawer stays closed until it's clicked; this is a second way to get
+// around, not a replacement for the link row.
+function DesktopNav({ current, onOpenSidebar, hasKey }) {
+  return (
+    <header className="ms-desktop-nav" style={{ borderBottom: `1px solid ${rule}`, background: paper, position: "sticky", top: 0, zIndex: 10 }}>
+      <div style={{ maxWidth: 1200, margin: "0 auto", padding: "16px 32px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 24, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <button onClick={onOpenSidebar} aria-label="Open menu" style={{
+            background: "transparent", border: `1px solid ${rule}`, borderRadius: 4,
+            width: 36, height: 36, display: "flex", alignItems: "center", justifyContent: "center",
+            cursor: "pointer", fontSize: 17, color: ink, padding: 0, flexShrink: 0,
+          }}>☰</button>
+          <a href="#home" style={{ display: "flex", alignItems: "center", gap: 10, background: "transparent", textDecoration: "none", cursor: "pointer", padding: 0 }}>
+            <Logo size={32}/>
+            <span style={{ fontFamily: "'Fraunces', serif", fontSize: 22, fontWeight: 500, color: ink, letterSpacing: "-0.01em" }}>Marksmith</span>
+          </a>
+        </div>
+        <nav style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
+          {NAV_ITEMS.map((it) => {
+            const active = current === it.id;
+            const isSettings = it.id === "settings";
+            return (
+              <a key={it.id} href={`#${it.id}`} style={{
+                background: active ? paperDeep : "transparent",
+                color: active ? ink : inkSoft,
+                textDecoration: "none", padding: "8px 14px", cursor: "pointer",
+                fontFamily: "'Inter', sans-serif", fontSize: 13,
+                fontWeight: active ? 600 : 400, borderRadius: 2,
+                borderBottom: active ? `1.5px solid ${bronze}` : "1.5px solid transparent",
+                display: "flex", alignItems: "center", gap: 6,
+              }}>
+                {it.label}
+                {isSettings && !hasKey && <span title="Not signed in" style={{ width: 6, height: 6, borderRadius: "50%", background: warn, display: "inline-block" }}/>}
+              </a>
+            );
+          })}
+        </nav>
+      </div>
+    </header>
+  );
+}
+// The slide-out drawer itself — shared by the desktop ☰ button and the
+// phone top bar. Closed by default on every screen size; only the trigger
+// that opens it differs.
 function Sidebar({ current, onNav, hasKey, open, onClose }) {
   return (
     <>
@@ -1990,8 +2033,9 @@ export default function App() {
   return (
     <div style={{ background: paper, minHeight: "100vh", color: ink, fontFamily: "'Inter', system-ui, sans-serif" }}>
       <style>{fontsCSS}{responsiveCSS}</style>
-      <Sidebar current={page} onNav={goTo} hasKey={hasKey} open={sidebarOpen} onClose={() => setSidebarOpen(false)}/>
+      <DesktopNav current={page} onOpenSidebar={() => setSidebarOpen(true)} hasKey={hasKey}/>
       <MobileTopBar onOpen={() => setSidebarOpen(true)}/>
+      <Sidebar current={page} onNav={goTo} hasKey={hasKey} open={sidebarOpen} onClose={() => setSidebarOpen(false)}/>
       <div className="ms-main">
         {page === "home" && <Home onNav={goTo} reviewCount={savedReviews.length} rubric={rubric} hasKey={hasKey}/>}
         {page === "review" && <ReviewTool apiKey={apiKey} rubric={rubric} onSaveReview={handleSaveReview} onNav={goTo}/>}
