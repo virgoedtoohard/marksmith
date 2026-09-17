@@ -15,6 +15,20 @@ const paperDeep = "#F1EDE1";
 
 const fontsCSS = `@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap');`;
 
+// Everything on the site is styled inline, which reads the same on every
+// screen size unless we say otherwise. This one small stylesheet is the
+// "otherwise": on phone-width screens it narrows the side margins and
+// collapses side-by-side layouts (grids marked .ms-split-2 / .ms-criterion)
+// into a single column, so pages don't stay locked to a desktop layout that
+// forces zooming or sideways scrolling. It never changes anything above the
+// breakpoint, so the desktop layout is untouched.
+const responsiveCSS = `
+@media (max-width: 720px) {
+  .ms-page, .ms-nav-inner, .ms-footer { padding-left: 16px !important; padding-right: 16px !important; }
+  .ms-split-2, .ms-criterion { grid-template-columns: 1fr !important; }
+}
+`;
+
 // ============ ROUTING ============
 // Every page has a real URL (#home, #review, #compare, …) so nav links are
 // genuine <a href> tags: normal click navigates in place, and ctrl/cmd-click,
@@ -491,7 +505,7 @@ function Nav({ current, onNav, hasKey }) {
   ];
   return (
     <header style={{ borderBottom: `1px solid ${rule}`, background: paper, position: "sticky", top: 0, zIndex: 10 }}>
-      <div style={{ maxWidth: 1200, margin: "0 auto", padding: "16px 32px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 24, flexWrap: "wrap" }}>
+      <div style={{ maxWidth: 1200, margin: "0 auto", padding: "16px 32px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 24, flexWrap: "wrap" }} className="ms-nav-inner">
         <a href="#home" style={{ display: "flex", alignItems: "center", gap: 10, background: "transparent", textDecoration: "none", cursor: "pointer", padding: 0 }}>
           <Logo size={32}/>
           <span style={{ fontFamily: "'Fraunces', serif", fontSize: 22, fontWeight: 500, color: ink, letterSpacing: "-0.01em" }}>Marksmith</span>
@@ -532,14 +546,14 @@ function Home({ onNav, reviewCount, rubric, hasKey }) {
   ];
 
   return (
-    <div style={{ maxWidth: 1200, margin: "0 auto", padding: "64px 32px 80px" }}>
+    <div style={{ maxWidth: 1200, margin: "0 auto", padding: "64px 32px 80px" }} className="ms-page">
       {!hasKey && <KeyBanner onNav={onNav}/>}
-      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.4fr) minmax(0, 1fr)", gap: 60, alignItems: "start" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.4fr) minmax(0, 1fr)", gap: 60, alignItems: "start" }} className="ms-split-2">
         <div>
           <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: "0.18em", color: bronze, textTransform: "uppercase", marginBottom: 10 }}>
             The Reviewer's Desk
           </div>
-          <h1 style={{ fontFamily: "'Fraunces', serif", fontSize: 88, lineHeight: 0.95, margin: 0, fontWeight: 500, letterSpacing: "-0.03em", color: ink }}>
+          <h1 style={{ fontFamily: "'Fraunces', serif", fontSize: "clamp(40px, 12vw, 88px)", lineHeight: 0.95, margin: 0, fontWeight: 500, letterSpacing: "-0.03em", color: ink }}>
             Marksmith
           </h1>
           <p style={{ fontFamily: "'Fraunces', serif", fontStyle: "italic", fontSize: 22, color: inkSoft, marginTop: 20, marginBottom: 0, lineHeight: 1.4, maxWidth: 520 }}>
@@ -678,10 +692,10 @@ Respond with ONLY valid JSON (no markdown, no preamble):
   }
 
   return (
-    <div style={{ maxWidth: 1200, margin: "0 auto", padding: "40px 32px 80px" }}>
+    <div style={{ maxWidth: 1200, margin: "0 auto", padding: "40px 32px 80px" }} className="ms-page">
       <PageHeader eyebrow="Tool I" title="Review" desc="Read one application. Get facts, questions, and a scorecard."/>
       {!apiKey && <div style={{ marginTop: 24 }}><KeyBanner onNav={onNav}/></div>}
-      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)", gap: 40, marginTop: 40 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)", gap: 40, marginTop: 40 }} className="ms-split-2">
         <section>
           <SectionLabel n="01" title="The Application"/>
           <input value={applicantLabel} onChange={(e) => setApplicantLabel(e.target.value)}
@@ -959,7 +973,7 @@ Respond with ONLY valid JSON:
   const validCount = applicants.filter((a) => a.fileBlock || a.text.trim().length > 30).length;
 
   return (
-    <div style={{ maxWidth: 1200, margin: "0 auto", padding: "40px 32px 80px" }}>
+    <div style={{ maxWidth: 1200, margin: "0 auto", padding: "40px 32px 80px" }} className="ms-page">
       <PageHeader eyebrow="Tool II" title="Compare" desc="Score multiple applications. See them ranked side by side."/>
       {!apiKey && <div style={{ marginTop: 24 }}><KeyBanner onNav={onNav}/></div>}
 
@@ -1092,7 +1106,7 @@ Respond with ONLY valid JSON:
                     </div>
                   </div>
                   {!r.error && (
-                    <div style={{ marginTop: 14, display: "grid", gridTemplateColumns: `repeat(${r.scores?.length || 1}, 1fr)`, gap: 4 }}>
+                    <div style={{ marginTop: 14, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(64px, 1fr))", gap: 4 }}>
                       {r.scores?.map((s, j) => {
                         const p = s.maxPoints > 0 ? s.points / s.maxPoints : 0;
                         return (
@@ -1167,7 +1181,7 @@ function RubricBuilder({ rubric, setRubric, apiKey, onNav }) {
   }
 
   return (
-    <div style={{ maxWidth: 1000, margin: "0 auto", padding: "40px 32px 80px" }}>
+    <div style={{ maxWidth: 1000, margin: "0 auto", padding: "40px 32px 80px" }} className="ms-page">
       <PageHeader eyebrow="Tool III" title="Rubric" desc="Shape the scoring criteria that fit your scholarship."/>
 
       <div style={{ marginTop: 40 }}>
@@ -1248,7 +1262,7 @@ function RubricBuilder({ rubric, setRubric, apiKey, onNav }) {
           )}
           {rubric.map((c, i) => (
             <div key={c.id} style={{ padding: "16px 20px", borderTop: i === 0 ? "none" : `1px solid ${rule}` }}>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 90px 80px", gap: 12, alignItems: "start" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 90px 80px", gap: 12, alignItems: "start" }} className="ms-criterion">
                 <div>
                   <input value={c.name} onChange={(e) => updateCriterion(c.id, { name: e.target.value })}
                     style={{ ...editInput, fontFamily: "'Fraunces', serif", fontSize: 17 }}/>
@@ -1397,7 +1411,7 @@ function RecordsPage({ records, onUpdateStatus, onUpdateNote, onDelete, hasKey, 
   // once signed out, even though the browser still holds them locally.
   if (!hasKey) {
     return (
-      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "40px 32px 80px" }}>
+      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "40px 32px 80px" }} className="ms-page">
         <PageHeader eyebrow="Records" title="Application records" desc="Sign in to view the applications your organization has reviewed."/>
         <div style={{ marginTop: 32, border: `1px dashed ${rule}`, padding: "60px 24px", textAlign: "center", color: muted, borderRadius: 2 }}>
           <div style={{ fontFamily: "'Fraunces', serif", fontSize: 22, color: inkSoft, marginBottom: 8 }}>Signed out</div>
@@ -1412,7 +1426,7 @@ function RecordsPage({ records, onUpdateStatus, onUpdateNote, onDelete, hasKey, 
   }
 
   return (
-    <div style={{ maxWidth: 1100, margin: "0 auto", padding: "40px 32px 80px" }}>
+    <div style={{ maxWidth: 1100, margin: "0 auto", padding: "40px 32px 80px" }} className="ms-page">
       <PageHeader eyebrow="Records" title="Application records" desc="Every application you've reviewed, with its score and decision status — kept in this browser."/>
 
       <div style={{ marginTop: 32, display: "flex", gap: 12, flexWrap: "wrap", justifyContent: "space-between", alignItems: "center" }}>
@@ -1538,7 +1552,7 @@ ${(selected.keyFacts || []).map((f) => `- ${f}`).join("\n")}`;
   // show it while signed out.
   if (!apiKey) {
     return (
-      <div style={{ maxWidth: 1200, margin: "0 auto", padding: "40px 32px 80px" }}>
+      <div style={{ maxWidth: 1200, margin: "0 auto", padding: "40px 32px 80px" }} className="ms-page">
         <PageHeader eyebrow="Tool IV" title="Feedback" desc="Draft the letter that goes to the applicant."/>
         <div style={{ marginTop: 24 }}><KeyBanner onNav={onNav}/></div>
       </div>
@@ -1546,10 +1560,10 @@ ${(selected.keyFacts || []).map((f) => `- ${f}`).join("\n")}`;
   }
 
   return (
-    <div style={{ maxWidth: 1200, margin: "0 auto", padding: "40px 32px 80px" }}>
+    <div style={{ maxWidth: 1200, margin: "0 auto", padding: "40px 32px 80px" }} className="ms-page">
       <PageHeader eyebrow="Tool IV" title="Feedback" desc="Draft the letter that goes to the applicant."/>
 
-      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.2fr)", gap: 40, marginTop: 40 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.2fr)", gap: 40, marginTop: 40 }} className="ms-split-2">
         <section>
           <SectionLabel n="01" title="Setup"/>
           <SubHeading>Reviewed application</SubHeading>
@@ -1691,7 +1705,7 @@ function Settings({ apiKey, setApiKey, orgName, setOrgName }) {
   }
 
   return (
-    <div style={{ maxWidth: 800, margin: "0 auto", padding: "40px 32px 80px" }}>
+    <div style={{ maxWidth: 800, margin: "0 auto", padding: "40px 32px 80px" }} className="ms-page">
       <PageHeader eyebrow="Settings" title="Sign in" desc="Sign in with the access code and password your administrator gave you."/>
 
       <div style={{ marginTop: 40 }}>
@@ -1729,7 +1743,7 @@ function Settings({ apiKey, setApiKey, orgName, setOrgName }) {
 // ============ ABOUT ============
 function About() {
   return (
-    <div style={{ maxWidth: 800, margin: "0 auto", padding: "60px 32px 80px" }}>
+    <div style={{ maxWidth: 800, margin: "0 auto", padding: "60px 32px 80px" }} className="ms-page">
       <PageHeader eyebrow="About" title="How Marksmith works" desc=""/>
       <div style={{ marginTop: 40, fontFamily: "'Fraunces', serif", fontSize: 20, lineHeight: 1.55, color: ink }}>
         <p>Marksmith is a reviewer's desk for scholarship applications. It reads what you paste or upload, extracts the facts, raises the questions a careful reviewer would raise, and scores every section against a rubric that <em>you</em> shape.</p>
@@ -1772,7 +1786,7 @@ function PageHeader({ eyebrow, title, desc }) {
 // ============ FOOTER ============
 function Footer() {
   return (
-    <footer style={{ borderTop: `1px solid ${rule}`, marginTop: 40, padding: "24px 32px" }}>
+    <footer style={{ borderTop: `1px solid ${rule}`, marginTop: 40, padding: "24px 32px" }} className="ms-footer">
       <div style={{ maxWidth: 1200, margin: "0 auto", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 20, flexWrap: "wrap" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <Logo size={20}/>
@@ -1927,7 +1941,7 @@ export default function App() {
 
   return (
     <div style={{ background: paper, minHeight: "100vh", color: ink, fontFamily: "'Inter', system-ui, sans-serif" }}>
-      <style>{fontsCSS}</style>
+      <style>{fontsCSS}{responsiveCSS}</style>
       <Nav current={page} onNav={goTo} hasKey={hasKey}/>
       {page === "home" && <Home onNav={goTo} reviewCount={savedReviews.length} rubric={rubric} hasKey={hasKey}/>}
       {page === "review" && <ReviewTool apiKey={apiKey} rubric={rubric} onSaveReview={handleSaveReview} onNav={goTo}/>}
