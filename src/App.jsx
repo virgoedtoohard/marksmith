@@ -12,20 +12,28 @@ const good = "#5C7A5F";
 const warn = "#B5804A";
 const bad = "#A85A4A";
 const paperDeep = "#F1EDE1";
+const SIDEBAR_WIDTH = 240;
 
 const fontsCSS = `@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap');`;
 
 // Everything on the site is styled inline, which reads the same on every
 // screen size unless we say otherwise. This one small stylesheet is the
-// "otherwise": on phone-width screens it narrows the side margins and
-// collapses side-by-side layouts (grids marked .ms-split-2 / .ms-criterion)
-// into a single column, so pages don't stay locked to a desktop layout that
-// forces zooming or sideways scrolling. It never changes anything above the
-// breakpoint, so the desktop layout is untouched.
+// "otherwise": it narrows side margins and collapses side-by-side layouts
+// (grids marked .ms-split-2 / .ms-criterion) into a single column on phone
+// widths, and switches the navigation between a pinned desktop sidebar and
+// a phone drawer opened from a fixed top bar.
 const responsiveCSS = `
+.ms-main { margin-left: 0; padding-top: 56px; }
+.ms-mobile-topbar { display: none; }
 @media (max-width: 720px) {
-  .ms-page, .ms-nav-inner, .ms-footer { padding-left: 16px !important; padding-right: 16px !important; }
+  .ms-mobile-topbar { display: flex !important; }
+  .ms-page, .ms-footer { padding-left: 16px !important; padding-right: 16px !important; }
   .ms-split-2, .ms-criterion { grid-template-columns: 1fr !important; }
+}
+@media (min-width: 721px) {
+  .ms-sidebar { transform: none !important; }
+  .ms-backdrop { display: none !important; }
+  .ms-main { margin-left: ${SIDEBAR_WIDTH}px !important; padding-top: 0 !important; }
 }
 `;
 
@@ -492,46 +500,82 @@ function KeyBanner({ onNav }) {
 }
 
 // ============ NAV ============
-function Nav({ current, onNav, hasKey }) {
-  const items = [
-    { id: "home", label: "Home" },
-    { id: "review", label: "Review" },
-    { id: "compare", label: "Compare" },
-    { id: "rubric", label: "Rubric" },
-    { id: "feedback", label: "Feedback" },
-    { id: "records", label: "Records" },
-    { id: "about", label: "About" },
-    { id: "settings", label: "Settings" },
-  ];
+const NAV_ITEMS = [
+  { id: "home", label: "Home" },
+  { id: "review", label: "Review" },
+  { id: "compare", label: "Compare" },
+  { id: "rubric", label: "Rubric" },
+  { id: "feedback", label: "Feedback" },
+  { id: "records", label: "Records" },
+  { id: "about", label: "About" },
+  { id: "settings", label: "Settings" },
+];
+// A left sidebar on desktop (always visible, pinned) and a slide-out drawer
+// on phone (opened from a fixed top bar) — same set of links either way, so
+// there's one menu to maintain instead of a desktop nav and a separate
+// mobile one.
+function Sidebar({ current, onNav, hasKey, open, onClose }) {
   return (
-    <header style={{ borderBottom: `1px solid ${rule}`, background: paper, position: "sticky", top: 0, zIndex: 10 }}>
-      <div style={{ maxWidth: 1200, margin: "0 auto", padding: "16px 32px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 24, flexWrap: "wrap" }} className="ms-nav-inner">
-        <a href="#home" style={{ display: "flex", alignItems: "center", gap: 10, background: "transparent", textDecoration: "none", cursor: "pointer", padding: 0 }}>
-          <Logo size={32}/>
-          <span style={{ fontFamily: "'Fraunces', serif", fontSize: 22, fontWeight: 500, color: ink, letterSpacing: "-0.01em" }}>Marksmith</span>
+    <>
+      {open && (
+        <div className="ms-backdrop" onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(31,35,51,0.45)", zIndex: 19 }}/>
+      )}
+      <aside className="ms-sidebar" style={{
+        position: "fixed", top: 0, left: 0, height: "100vh", width: SIDEBAR_WIDTH,
+        background: paper, borderRight: `1px solid ${rule}`, zIndex: 20,
+        display: "flex", flexDirection: "column", padding: "24px 18px",
+        boxSizing: "border-box", overflowY: "auto",
+        transform: open ? "translateX(0)" : "translateX(-100%)",
+        transition: "transform 220ms ease",
+      }}>
+        <a href="#home" onClick={onClose} style={{ display: "flex", alignItems: "center", gap: 10, textDecoration: "none", marginBottom: 32, padding: "0 6px" }}>
+          <Logo size={30}/>
+          <span style={{ fontFamily: "'Fraunces', serif", fontSize: 20, fontWeight: 500, color: ink, letterSpacing: "-0.01em" }}>Marksmith</span>
         </a>
-        <nav style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
-          {items.map((it) => {
+        <nav style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          {NAV_ITEMS.map((it) => {
             const active = current === it.id;
             const isSettings = it.id === "settings";
             return (
-              <a key={it.id} href={`#${it.id}`} style={{
+              <a key={it.id} href={`#${it.id}`} onClick={onClose} style={{
                 background: active ? paperDeep : "transparent",
                 color: active ? ink : inkSoft,
-                textDecoration: "none", padding: "8px 14px", cursor: "pointer",
-                fontFamily: "'Inter', sans-serif", fontSize: 13,
-                fontWeight: active ? 600 : 400, borderRadius: 2,
-                borderBottom: active ? `1.5px solid ${bronze}` : "1.5px solid transparent",
-                display: "flex", alignItems: "center", gap: 6,
+                textDecoration: "none", padding: "10px 12px", cursor: "pointer",
+                fontFamily: "'Inter', sans-serif", fontSize: 14,
+                fontWeight: active ? 600 : 400, borderRadius: 3,
+                borderLeft: active ? `2.5px solid ${bronze}` : "2.5px solid transparent",
+                display: "flex", alignItems: "center", gap: 8,
               }}>
                 {it.label}
-                {isSettings && !hasKey && <span title="Not signed in" style={{ width: 6, height: 6, borderRadius: "50%", background: warn, display: "inline-block" }}/>}
+                {isSettings && !hasKey && <span title="Not signed in" style={{ width: 6, height: 6, borderRadius: "50%", background: warn, display: "inline-block", marginLeft: "auto" }}/>}
               </a>
             );
           })}
         </nav>
-      </div>
-    </header>
+      </aside>
+    </>
+  );
+}
+// The fixed top bar shown only on phone widths — brand on the left, the
+// button that opens the sidebar drawer on the right. Desktop never sees
+// this; the sidebar is already sitting there.
+function MobileTopBar({ onOpen }) {
+  return (
+    <div className="ms-mobile-topbar" style={{
+      display: "none", position: "fixed", top: 0, left: 0, right: 0, height: 56,
+      background: paper, borderBottom: `1px solid ${rule}`, zIndex: 15,
+      alignItems: "center", justifyContent: "space-between", padding: "0 16px", boxSizing: "border-box",
+    }}>
+      <a href="#home" style={{ display: "flex", alignItems: "center", gap: 8, textDecoration: "none" }}>
+        <Logo size={24}/>
+        <span style={{ fontFamily: "'Fraunces', serif", fontSize: 17, fontWeight: 500, color: ink }}>Marksmith</span>
+      </a>
+      <button onClick={onOpen} aria-label="Open menu" style={{
+        background: "transparent", border: `1px solid ${rule}`, borderRadius: 4,
+        width: 38, height: 38, display: "flex", alignItems: "center", justifyContent: "center",
+        cursor: "pointer", fontSize: 18, color: ink, padding: 0,
+      }}>☰</button>
+    </div>
   );
 }
 
@@ -1807,6 +1851,7 @@ export default function App() {
   const [savedReviews, setSavedReviews] = useState(loadRecords());
   const [apiKey, setApiKeyState] = useState(loadApiKey());
   const [orgName, setOrgNameState] = useState(loadOrgName());
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   // Keep the page in sync with the URL hash — this is what makes nav links
   // real pages: back/forward, refresh, and opening a link in a new tab all
@@ -1816,6 +1861,9 @@ export default function App() {
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
+  // Close the phone drawer whenever the page changes — including via back/
+  // forward or a link that wasn't inside the sidebar itself.
+  useEffect(() => { setSidebarOpen(false); }, [page]);
   function goTo(id) {
     if (typeof window !== "undefined" && window.location.hash.replace(/^#\/?/, "") !== id) {
       window.location.hash = id;
@@ -1942,16 +1990,19 @@ export default function App() {
   return (
     <div style={{ background: paper, minHeight: "100vh", color: ink, fontFamily: "'Inter', system-ui, sans-serif" }}>
       <style>{fontsCSS}{responsiveCSS}</style>
-      <Nav current={page} onNav={goTo} hasKey={hasKey}/>
-      {page === "home" && <Home onNav={goTo} reviewCount={savedReviews.length} rubric={rubric} hasKey={hasKey}/>}
-      {page === "review" && <ReviewTool apiKey={apiKey} rubric={rubric} onSaveReview={handleSaveReview} onNav={goTo}/>}
-      {page === "compare" && <CompareTool apiKey={apiKey} rubric={rubric} onSaveReview={handleSaveReview} onNav={goTo}/>}
-      {page === "rubric" && <RubricBuilder rubric={rubric} setRubric={setRubric} apiKey={apiKey} onNav={goTo}/>}
-      {page === "feedback" && <FeedbackComposer apiKey={apiKey} savedReviews={savedReviews} orgName={orgName} onSaveLetter={addLetterToRecord} onNav={goTo}/>}
-      {page === "records" && <RecordsPage records={savedReviews} onUpdateStatus={updateRecordStatus} onUpdateNote={updateRecordNote} onDelete={deleteRecord} hasKey={hasKey} onNav={goTo}/>}
-      {page === "settings" && <Settings apiKey={apiKey} setApiKey={setApiKey} orgName={orgName} setOrgName={setOrgName}/>}
-      {page === "about" && <About/>}
-      <Footer/>
+      <Sidebar current={page} onNav={goTo} hasKey={hasKey} open={sidebarOpen} onClose={() => setSidebarOpen(false)}/>
+      <MobileTopBar onOpen={() => setSidebarOpen(true)}/>
+      <div className="ms-main">
+        {page === "home" && <Home onNav={goTo} reviewCount={savedReviews.length} rubric={rubric} hasKey={hasKey}/>}
+        {page === "review" && <ReviewTool apiKey={apiKey} rubric={rubric} onSaveReview={handleSaveReview} onNav={goTo}/>}
+        {page === "compare" && <CompareTool apiKey={apiKey} rubric={rubric} onSaveReview={handleSaveReview} onNav={goTo}/>}
+        {page === "rubric" && <RubricBuilder rubric={rubric} setRubric={setRubric} apiKey={apiKey} onNav={goTo}/>}
+        {page === "feedback" && <FeedbackComposer apiKey={apiKey} savedReviews={savedReviews} orgName={orgName} onSaveLetter={addLetterToRecord} onNav={goTo}/>}
+        {page === "records" && <RecordsPage records={savedReviews} onUpdateStatus={updateRecordStatus} onUpdateNote={updateRecordNote} onDelete={deleteRecord} hasKey={hasKey} onNav={goTo}/>}
+        {page === "settings" && <Settings apiKey={apiKey} setApiKey={setApiKey} orgName={orgName} setOrgName={setOrgName}/>}
+        {page === "about" && <About/>}
+        <Footer/>
+      </div>
     </div>
   );
 }
